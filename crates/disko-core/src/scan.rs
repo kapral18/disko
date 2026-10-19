@@ -171,6 +171,7 @@ struct Ctx<'a> {
     root_device: u64,
     /// Mount points to stop at, resolved once before the walk starts.
     remote_mounts: Vec<PathBuf>,
+    system_mounts: Vec<PathBuf>,
     /// (device, inode) pairs already counted, for hard-link dedup.
     seen_links: Mutex<HashSet<(u64, u64)>>,
 }
@@ -178,6 +179,14 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     fn is_remote_mount(&self, path: &Path) -> bool {
         self.remote_mounts.iter().any(|mount| mount == path)
+    }
+
+    /// `system_mounts` is sorted and deduplicated by `system_mount_points_from`;
+    /// on Linux it can hold hundreds of rows and is consulted per directory.
+    fn is_system_mount(&self, path: &Path) -> bool {
+        self.system_mounts
+            .binary_search_by(|mount| mount.as_path().cmp(path))
+            .is_ok()
     }
 
     /// True the first time this inode is seen, false for every later link.
@@ -199,22 +208,39 @@ pub fn scan(
     progress: &Progress,
     cancel: &Cancel,
 ) -> Result<DiskEntry> {
+    scan_within(root, options, progress, cancel, &MountBoundaries::default())
+}
+
+/// The mount points scans stop at, read from the OS once and then shared.
+/// Listing mounts costs 50–100 ms on macOS; a run of small scans started one
+/// after another (each folder opened while a whole-disk scan runs) should
+/// pay it once, not once per folder. Cloning shares the listing.
+#[derive(Clone, Debug, Default)]
+pub struct MountBoundaries(Arc<std::sync::OnceLock<(Vec<PathBuf>, Vec<PathBuf>)>>);
+
+fn scan_within(
+    root: &Path,
+    options: &ScanOptions,
+    progress: &Progress,
+    cancel: &Cancel,
+    boundaries: &MountBoundaries,
+) -> Result<DiskEntry> {
     let root = root
         .canonicalize()
         .with_context(|| format!("cannot read {}", root.display()))?;
     let meta =
         fs::symlink_metadata(&root).with_context(|| format!("cannot stat {}", root.display()))?;
 
-    let remote_mounts = if options.skip_remote {
-        crate::mounts::remote_mount_points()
-            .into_iter()
-            // Scanning a network mount on purpose is allowed; wandering into
-            // one by accident is what this guards against.
-            .filter(|mount| mount != &root)
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let (remote_mounts, system_mounts) = boundaries
+        .0
+        .get_or_init(|| crate::mounts::scan_boundaries(options.skip_remote))
+        .clone();
+    let remote_mounts = remote_mounts
+        .into_iter()
+        // Scanning a network mount on purpose is allowed; wandering into
+        // one by accident is what this guards against.
+        .filter(|mount| mount != &root)
+        .collect();
 
     let ctx = Ctx {
         options,
@@ -222,14 +248,16 @@ pub fn scan(
         cancel,
         root_device: device_of(&meta),
         remote_mounts,
+        system_mounts: system_mount_points(&root, system_mounts),
         seen_links: Mutex::new(HashSet::new()),
     };
 
-    let entry = if meta.is_dir() {
+    let mut entry = if meta.is_dir() {
         scan_dir(&root, &meta, 0, &ctx)
     } else {
-        leaf_entry(&root, 0, &meta, &ctx)
+        leaf_entry(root.as_os_str(), &meta, &ctx)
     };
+    entry.set_filesystem_identity(filesystem_identity(&meta));
 
     progress.finish();
     Ok(entry)
@@ -251,6 +279,61 @@ pub fn scan_in_background_streaming(
     options: ScanOptions,
     stream_depth: usize,
 ) -> (Arc<Progress>, Cancel, JoinHandle<Result<DiskEntry>>) {
+    spawn_scan(
+        root,
+        options,
+        stream_depth,
+        None,
+        MountBoundaries::default(),
+        None,
+    )
+}
+
+/// As [`scan_in_background`], for a scan a person is waiting on right now
+/// while a larger one runs. It walks on its own thread pool: a scan of
+/// a whole disk keeps every thread of the shared pool busy, and work queued
+/// behind it would wait for that scan rather than run beside it.
+///
+/// `boundaries` is shared by every prioritized scan of one session, all with
+/// the same `skip_remote`, so only the first lists the mounts.
+///
+/// `root` is a folder the caller already has on screen under that exact
+/// path, inside a larger scan rooted at `within`. The scan fails before
+/// walking anything when `root` now resolves elsewhere (swapped for a
+/// symlink), or when the larger scan would not walk it: it sits in a
+/// network share or system mount, or under `-x` on another filesystem.
+pub fn scan_in_background_prioritized(
+    root: PathBuf,
+    within: PathBuf,
+    options: ScanOptions,
+    boundaries: MountBoundaries,
+) -> (Arc<Progress>, Cancel, JoinHandle<Result<DiskEntry>>) {
+    spawn_scan(root, options, 0, priority_pool(), boundaries, Some(within))
+}
+
+/// Built on first use, as wide as the shared pool so the two split the
+/// machine evenly while both run; `None` if the OS refuses the threads, in
+/// which case prioritized scans share the global pool like any other.
+static PRIORITY_POOL: std::sync::LazyLock<Option<rayon::ThreadPool>> =
+    std::sync::LazyLock::new(|| {
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|index| format!("disko-priority-{index}"))
+            .build()
+            .ok()
+    });
+
+fn priority_pool() -> Option<&'static rayon::ThreadPool> {
+    PRIORITY_POOL.as_ref()
+}
+
+fn spawn_scan(
+    root: PathBuf,
+    options: ScanOptions,
+    stream_depth: usize,
+    pool: Option<&'static rayon::ThreadPool>,
+    boundaries: MountBoundaries,
+    session_root: Option<PathBuf>,
+) -> (Arc<Progress>, Cancel, JoinHandle<Result<DiskEntry>>) {
     let progress = Arc::new(Progress::streaming(stream_depth));
     let cancel = Cancel::new();
 
@@ -258,13 +341,70 @@ pub fn scan_in_background_streaming(
         let progress = Arc::clone(&progress);
         let cancel = cancel.clone();
         std::thread::spawn(move || {
-            let result = scan(&root, &options, &progress, &cancel);
+            let walk = || {
+                if let Some(within) = &session_root {
+                    refuse_a_root_its_session_skips(&root, within, &options, &boundaries)?;
+                }
+                scan_within(&root, &options, &progress, &cancel, &boundaries)
+            };
+            let result = match pool {
+                Some(pool) => pool.install(walk),
+                None => walk(),
+            };
             progress.finish();
             result
         })
     };
 
     (progress, cancel, handle)
+}
+
+/// A prioritized scan is part of a larger one rooted at `within`, so its
+/// root must be a folder that scan would walk: not one that moved (swapped
+/// for a symlink), and not inside a mount that scan stops at — a network
+/// share, a system mount, or under `-x` another filesystem. Scanning it as a
+/// root of its own would exempt it from the very rules that skip it.
+fn refuse_a_root_its_session_skips(
+    root: &Path,
+    within: &Path,
+    options: &ScanOptions,
+    boundaries: &MountBoundaries,
+) -> Result<()> {
+    if root.canonicalize().ok().as_deref() != Some(root) {
+        anyhow::bail!("{} now resolves somewhere else", root.display());
+    }
+    let (remote, system) = boundaries
+        .0
+        .get_or_init(|| crate::mounts::scan_boundaries(options.skip_remote));
+    // Under `-x`, the device every folder must share with the session's root;
+    // `None` when crossing devices is allowed (no `-x`) or the root is gone.
+    let session_device = options
+        .one_file_system
+        .then(|| {
+            fs::symlink_metadata(within)
+                .ok()
+                .map(|meta| device_of(&meta))
+        })
+        .flatten();
+    let skipped = |folder: &Path| {
+        remote.iter().any(|mount| mount == folder)
+            || system.iter().any(|mount| mount == folder)
+            || MACOS_SYSTEM_MOUNTS
+                .iter()
+                .any(|mount| Path::new(mount) == folder)
+            || session_device.is_some_and(|device| {
+                fs::symlink_metadata(folder).is_ok_and(|meta| device_of(&meta) != device)
+            })
+    };
+    // Every folder from just below the session's root down to `root`: the
+    // session would stop at the first that is a mount it skips.
+    let mut below_session = root
+        .ancestors()
+        .take_while(|folder| *folder != within && folder.starts_with(within));
+    if below_session.any(skipped) {
+        anyhow::bail!("{} is a mount the scan skips", root.display());
+    }
+    Ok(())
 }
 
 /// The root of a scan keeps the whole path it was given, since there is
@@ -280,58 +420,63 @@ fn entry_at(path: &Path, depth: usize, entry_type: EntryType) -> DiskEntry {
 
 fn scan_dir(path: &Path, meta: &Metadata, depth: usize, ctx: &Ctx) -> DiskEntry {
     let mut entry = entry_at(path, depth, EntryType::Directory);
+    entry.set_filesystem_identity(filesystem_identity(meta));
     // A directory's own inode occupies blocks, which is why `du` on an empty
     // tree is not zero. Its `st_size` is bookkeeping rather than content, so
     // it stays out of the apparent total — the same split `du` makes between
     // its default output and `--apparent-size`.
     entry.allocated_size = allocated_of(meta);
-    entry.modified = modified_of(meta);
+    entry.set_modified(modified_of(meta));
     ctx.progress.saw_entry(entry.allocated_size);
 
     if ctx.cancel.is_cancelled() {
-        entry.scan_state = ScanState::Cancelled;
+        entry.set_scan_state(ScanState::Cancelled);
         return entry;
     }
     ctx.progress.set_current(path);
 
-    let read_dir = match fs::read_dir(path) {
-        Ok(read_dir) => read_dir,
-        Err(_) => {
+    let contents = match read_dir_entries(path, ctx) {
+        Ok(contents) => contents,
+        Err(state) => {
             ctx.progress.saw_error();
-            entry.scan_state = ScanState::Denied;
+            entry.set_scan_state(state);
             return entry;
         }
     };
-    let dir_entries: Vec<_> = read_dir.filter_map(|result| result.ok()).collect();
+    // Stopped while listing: what was stat'd so far is kept, so a stopped
+    // scan still shows what it counted, but the directory says it is short.
+    if ctx.cancel.is_cancelled() {
+        entry.set_scan_state(ScanState::Cancelled);
+    }
 
-    let children: Vec<DiskEntry> = dir_entries
-        .par_iter()
-        .filter_map(|dir_entry| {
-            let child_path = join_exact(path, &dir_entry.file_name());
-            let child_meta = match fs::symlink_metadata(&child_path) {
-                Ok(meta) => meta,
-                Err(_) => {
-                    ctx.progress.saw_error();
-                    return None;
-                }
-            };
-
-            if !child_meta.is_dir() {
-                return Some(leaf_entry(&child_path, depth + 1, &child_meta, ctx));
-            }
-
-            let crosses_filesystem =
-                ctx.options.one_file_system && device_of(&child_meta) != ctx.root_device;
-            if crosses_filesystem || ctx.is_remote_mount(&child_path) {
-                let mut skipped = entry_at(&child_path, depth + 1, EntryType::Directory);
-                skipped.modified = modified_of(&child_meta);
-                skipped.scan_state = ScanState::Skipped;
-                return Some(skipped);
-            }
-
-            Some(scan_dir(&child_path, &child_meta, depth + 1, ctx))
-        })
-        .collect();
+    let scan_child = |child: Classified| {
+        let (child_path, child_meta) = match child {
+            Classified::Leaf(leaf) => return leaf,
+            Classified::Subdir(child_path, child_meta) => (child_path, child_meta),
+        };
+        let crosses_filesystem =
+            ctx.options.one_file_system && device_of(&child_meta) != ctx.root_device;
+        if crosses_filesystem
+            || ctx.is_system_mount(&child_path)
+            || ctx.is_remote_mount(&child_path)
+        {
+            let mut skipped = entry_at(&child_path, depth + 1, EntryType::Directory);
+            skipped.set_filesystem_identity(filesystem_identity(&child_meta));
+            skipped.set_modified(modified_of(&child_meta));
+            skipped.set_scan_state(ScanState::Skipped);
+            return skipped;
+        }
+        scan_dir(&child_path, &child_meta, depth + 1, ctx)
+    };
+    let subdirs = contents
+        .iter()
+        .filter(|child| matches!(child, Classified::Subdir(..)))
+        .count();
+    let mut children: Vec<DiskEntry> = if subdirs <= 1 {
+        contents.into_iter().map(scan_child).collect()
+    } else {
+        contents.into_par_iter().map(scan_child).collect()
+    };
 
     for child in &children {
         entry.absorb(child);
@@ -341,9 +486,6 @@ fn scan_dir(path: &Path, meta: &Metadata, depth: usize, ctx: &Ctx) -> DiskEntry 
     // at the end, so a capped scan of `/` never holds the whole tree at once.
     let keep_children = ctx.options.max_depth.is_none_or(|max| depth < max);
     if keep_children {
-        // Collecting in parallel leaves spare capacity on every one of these
-        // vectors, and there is one per directory for the rest of the session.
-        let mut children = children;
         children.shrink_to_fit();
         entry.children = children;
     }
@@ -352,7 +494,55 @@ fn scan_dir(path: &Path, meta: &Metadata, depth: usize, ctx: &Ctx) -> DiskEntry 
     entry
 }
 
-fn leaf_entry(path: &Path, depth: usize, meta: &Metadata, ctx: &Ctx) -> DiskEntry {
+/// One directory entry, stat'd and — for a leaf — counted. Built inside the
+/// parallel map below rather than after it, so a flat directory (a cache, a
+/// `node_modules`) pays for `stat` and for counting its files across every
+/// core instead of one.
+enum Classified {
+    Subdir(PathBuf, Metadata),
+    Leaf(DiskEntry),
+}
+
+/// The entries of `path` in `read_dir` order, minus those that failed to stat
+/// and, once the scan is cancelled, every entry not yet stat'd. `scan_dir`
+/// marks a listing cut short that way as `Cancelled`.
+fn read_dir_entries(path: &Path, ctx: &Ctx) -> Result<Vec<Classified>, ScanState> {
+    let read_dir = match fs::read_dir(path) {
+        Ok(read_dir) => read_dir,
+        Err(_) => return Err(ScanState::Denied),
+    };
+    let dir_entries: Vec<fs::DirEntry> = read_dir.filter_map(|result| result.ok()).collect();
+
+    Ok(dir_entries
+        .par_iter()
+        .filter_map(|dir_entry| {
+            // A stopped scan has no use for the rest of a huge directory, and
+            // its threads may be wanted by the next scan.
+            if ctx.cancel.is_cancelled() {
+                return None;
+            }
+            let child_path = join_exact(path, &dir_entry.file_name());
+            // `DirEntry::metadata()` on Apple platforms calls `fstatat` on
+            // the shared directory fd for every entry, serialising what
+            // should be parallel work; `symlink_metadata` on the joined path
+            // does not share that bottleneck.
+            match fs::symlink_metadata(&child_path) {
+                Ok(meta) if meta.is_dir() => Some(Classified::Subdir(child_path, meta)),
+                Ok(meta) => Some(Classified::Leaf(leaf_entry(
+                    &dir_entry.file_name(),
+                    &meta,
+                    ctx,
+                ))),
+                Err(_) => {
+                    ctx.progress.saw_error();
+                    None
+                }
+            }
+        })
+        .collect())
+}
+
+fn leaf_entry(name: &OsStr, meta: &Metadata, ctx: &Ctx) -> DiskEntry {
     let file_type = meta.file_type();
     let entry_type = if file_type.is_symlink() {
         EntryType::Symlink
@@ -362,8 +552,9 @@ fn leaf_entry(path: &Path, depth: usize, meta: &Metadata, ctx: &Ctx) -> DiskEntr
         EntryType::Other
     };
 
-    let mut entry = entry_at(path, depth, entry_type);
-    entry.modified = modified_of(meta);
+    let mut entry = DiskEntry::new(name, entry_type);
+    entry.set_filesystem_identity(filesystem_identity(meta));
+    entry.set_modified(modified_of(meta));
 
     // A hard link seen a second time contributes nothing: the blocks were
     // already counted under the path that reached it first.
@@ -431,6 +622,16 @@ fn inode_of(meta: &Metadata) -> u64 {
     meta.ino()
 }
 
+#[cfg(unix)]
+fn filesystem_identity(meta: &Metadata) -> Option<(u64, u64)> {
+    Some((device_of(meta), inode_of(meta)))
+}
+
+#[cfg(not(unix))]
+fn filesystem_identity(_meta: &Metadata) -> Option<(u64, u64)> {
+    None
+}
+
 #[cfg(not(unix))]
 fn inode_of(_meta: &Metadata) -> u64 {
     0
@@ -445,6 +646,42 @@ fn link_count(meta: &Metadata) -> u64 {
 #[cfg(not(unix))]
 fn link_count(_meta: &Metadata) -> u64 {
     1
+}
+
+fn system_mount_points(root: &Path, discovered: Vec<PathBuf>) -> Vec<PathBuf> {
+    #[cfg(test)]
+    if let Some(mounts) = TEST_SYSTEM_MOUNTS.with(|override_| override_.borrow().clone()) {
+        return system_mount_points_from(root, mounts);
+    }
+
+    system_mount_points_from(root, discovered)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_SYSTEM_MOUNTS: std::cell::RefCell<Option<Vec<PathBuf>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// sysinfo only reports browsable volumes on macOS, so devfs and the
+/// synthetic volumes never reach `scan_boundaries`; they are named here.
+#[cfg(target_os = "macos")]
+const MACOS_SYSTEM_MOUNTS: [&str; 4] = [
+    "/dev",
+    "/System/Volumes",
+    "/Volumes",
+    "/System/Volumes/Data/Volumes",
+];
+#[cfg(not(target_os = "macos"))]
+const MACOS_SYSTEM_MOUNTS: [&str; 0] = [];
+
+fn system_mount_points_from(root: &Path, mut mounts: Vec<PathBuf>) -> Vec<PathBuf> {
+    mounts.extend(MACOS_SYSTEM_MOUNTS.into_iter().map(PathBuf::from));
+    mounts.retain(|mount| mount != root);
+    mounts.sort();
+    mounts.dedup();
+    mounts
 }
 
 #[cfg(test)]
@@ -484,6 +721,22 @@ mod tests {
         scan(root, &options, &progress, &Cancel::new()).unwrap()
     }
 
+    fn with_system_mounts<T>(mounts: Vec<PathBuf>, test: impl FnOnce() -> T) -> T {
+        struct Reset(Option<Vec<PathBuf>>);
+
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_SYSTEM_MOUNTS.with(|override_| {
+                    override_.replace(self.0.take());
+                });
+            }
+        }
+
+        let previous = TEST_SYSTEM_MOUNTS.with(|override_| override_.replace(Some(mounts)));
+        let _reset = Reset(previous);
+        test()
+    }
+
     #[test]
     fn apparent_size_is_exactly_the_sum_of_file_lengths() {
         let tree = TempTree::new("sums");
@@ -496,7 +749,7 @@ mod tests {
         // Matches `du --apparent-size`: directory inodes are bookkeeping, not
         // content, so they do not inflate the total.
         assert_eq!(root.apparent_size, 6000);
-        assert_eq!(root.scan_state, ScanState::Complete);
+        assert_eq!(root.scan_state(), ScanState::Complete);
     }
 
     #[test]
@@ -562,6 +815,63 @@ mod tests {
     }
 
     #[test]
+    fn a_large_flat_directory_stats_in_parallel_with_identical_results() {
+        // Every entry in a directory is stat'd and counted inside the same
+        // parallel map; large enough that a per-entry ordering bug would show
+        // up as a missing or duplicated file rather than by chance passing.
+        let count = 600;
+        let tree = TempTree::new("parallel-stat");
+        let mut names: Vec<String> = Vec::with_capacity(count);
+        for i in 0..count {
+            let name = format!("file-{i:04}.txt");
+            tree.file(&name, 10);
+            names.push(name);
+        }
+
+        let root = scan_tree(&tree.0, ScanOptions::default());
+
+        assert_eq!(root.children.len(), count);
+        assert_eq!(root.apparent_size, (count * 10) as u64);
+        // root + every flat file.
+        assert_eq!(root.items, count as u64 + 1);
+
+        let mut seen: Vec<String> = root
+            .children
+            .iter()
+            .map(|child| child.name().into_owned())
+            .collect();
+        seen.sort();
+        let mut expected = names;
+        expected.sort();
+        assert_eq!(
+            seen, expected,
+            "every entry must still be present exactly once"
+        );
+    }
+
+    #[test]
+    fn children_keep_the_order_read_dir_lists_them_in() {
+        let tree = TempTree::new("order");
+        for i in 0..8 {
+            tree.file(&format!("file-{i}.txt"), 10);
+            tree.file(&format!("dir-{i}/inner.txt"), 10);
+        }
+
+        let root = scan_tree(&tree.0, ScanOptions::default());
+
+        let listed: Vec<String> = fs::read_dir(&tree.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let scanned: Vec<String> = root
+            .children
+            .iter()
+            .map(|child| child.name().into_owned())
+            .collect();
+        assert_eq!(scanned, listed);
+    }
+
+    #[test]
     fn cancelled_scan_returns_a_partial_tree() {
         let tree = TempTree::new("cancel");
         tree.file("a.txt", 10);
@@ -571,8 +881,87 @@ mod tests {
         cancel.cancel();
         let root = scan(&tree.0, &ScanOptions::default(), &progress, &cancel).unwrap();
 
-        assert_eq!(root.scan_state, ScanState::Cancelled);
+        assert_eq!(root.scan_state(), ScanState::Cancelled);
         assert!(root.children.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_prioritized_scan_of_a_moved_folder_walks_nothing() {
+        let tree = TempTree::new("moved-root");
+        tree.file("target/one.txt", 1000);
+        let base = tree.0.canonicalize().unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(base.join("target"), &link).unwrap();
+
+        let (progress, _, handle) = scan_in_background_prioritized(
+            link,
+            base.clone(),
+            ScanOptions::default(),
+            MountBoundaries::default(),
+        );
+
+        assert!(handle.join().unwrap().is_err());
+        assert_eq!(progress.entries(), 0, "the link's target was walked");
+    }
+
+    #[test]
+    fn a_prioritized_scan_inside_a_mount_its_session_skips_walks_nothing() {
+        let tree = TempTree::new("skipped-root");
+        tree.file("mounted/inner/one.txt", 1000);
+        let base = tree.0.canonicalize().unwrap();
+        let mounted = base.join("mounted");
+        // The session's mount listing names `mounted` as a system mount; the
+        // folder opened is a folder inside it.
+        let boundaries = MountBoundaries::default();
+        boundaries
+            .0
+            .set((Vec::new(), vec![mounted.clone()]))
+            .unwrap();
+
+        let (progress, _, handle) = scan_in_background_prioritized(
+            mounted.join("inner"),
+            base,
+            ScanOptions::default(),
+            boundaries,
+        );
+
+        assert!(handle.join().unwrap().is_err());
+        assert_eq!(progress.entries(), 0, "the skipped mount was walked");
+    }
+
+    #[test]
+    fn stopping_while_a_big_folder_is_listed_keeps_what_was_counted() {
+        let tree = TempTree::new("cancel-listing");
+        const FILES: usize = 5000;
+        for index in 0..FILES {
+            File::create(tree.0.join(format!("f{index}"))).unwrap();
+        }
+
+        // Racing a stop against a listing can lose: the listing may finish
+        // first on a busy machine. Every run must be consistent; retry until
+        // one is cut, which is the run this test is about.
+        for _ in 0..50 {
+            let (progress, cancel, handle) =
+                scan_in_background(tree.0.clone(), ScanOptions::default());
+            while progress.entries() < 50 && !handle.is_finished() {
+                std::hint::spin_loop();
+            }
+            cancel.cancel();
+            let root = handle.join().unwrap().unwrap();
+
+            assert_eq!(root.items, 1 + root.children.len() as u64);
+            if root.children.len() < FILES {
+                assert_eq!(
+                    root.scan_state(),
+                    ScanState::Cancelled,
+                    "a cut listing says so"
+                );
+                assert!(!root.children.is_empty(), "what was counted stays");
+                return;
+            }
+        }
+        panic!("no run was stopped before the listing finished");
     }
 
     #[test]
@@ -729,5 +1118,121 @@ mod tests {
 
         assert_eq!(raw.apparent_size - deduped.apparent_size, 4096);
         assert_eq!(deduped.items, raw.items);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directories_are_counted_as_links_not_traversed() {
+        let tree = TempTree::new("directory-symlink");
+        tree.file("target/only-once.bin", 4096);
+        std::os::unix::fs::symlink(tree.0.join("target"), tree.0.join("alias")).unwrap();
+
+        let scanned = scan_tree(&tree.0, ScanOptions::default());
+        let alias = scanned.resolve(&tree.0.join("alias")).unwrap();
+
+        assert_eq!(alias.entry_type, EntryType::Symlink);
+        assert!(alias.children.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_scanned_entry_keeps_its_filesystem_identity() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tree = TempTree::new("entry-identities");
+        tree.file("child.bin", 100);
+        let file = tree.0.join("child.bin");
+        let root_meta = fs::symlink_metadata(&tree.0).unwrap();
+        let file_meta = fs::symlink_metadata(&file).unwrap();
+
+        let scanned = scan_tree(&tree.0, ScanOptions::default());
+
+        assert_eq!(
+            scanned.filesystem_identity(),
+            Some((root_meta.dev(), root_meta.ino()))
+        );
+        assert_eq!(
+            scanned.resolve(&file).unwrap().filesystem_identity(),
+            Some((file_meta.dev(), file_meta.ino()))
+        );
+    }
+
+    #[test]
+    fn system_mount_points_are_skipped() {
+        let mounts = system_mount_points(Path::new("/not-a-mount"), Vec::new());
+        #[cfg(target_os = "macos")]
+        {
+            assert!(mounts.contains(&PathBuf::from("/System/Volumes")));
+            assert!(mounts.contains(&PathBuf::from("/Volumes")));
+            assert!(mounts.contains(&PathBuf::from("/dev")));
+            assert!(mounts.contains(&PathBuf::from("/System/Volumes/Data/Volumes")));
+        }
+        assert!(!mounts.contains(&PathBuf::from("/not-a-mount")));
+    }
+
+    #[test]
+    fn scan_wires_discovered_system_mounts_into_the_skip_branch() {
+        let tree = TempTree::new("system-mount-wiring");
+        let mount = tree.0.join("mounted");
+        fs::create_dir(&mount).unwrap();
+        tree.file("mounted/external.bin", 4096);
+        let mount = mount.canonicalize().unwrap();
+
+        let scanned = with_system_mounts(vec![mount.clone()], || {
+            scan_tree(&tree.0, ScanOptions::default())
+        });
+        let skipped = scanned.resolve(&mount).unwrap();
+
+        assert_eq!(skipped.scan_state(), ScanState::Skipped);
+        assert!(skipped.children.is_empty());
+    }
+
+    #[test]
+    fn discovered_pseudo_mounts_are_included_except_for_an_explicit_root() {
+        let mounts = vec![PathBuf::from("/snap/core/1"), PathBuf::from("/proc")];
+
+        let filtered = system_mount_points_from(Path::new("/proc"), mounts);
+
+        assert!(filtered.contains(&PathBuf::from("/snap/core/1")));
+        assert!(!filtered.contains(&PathBuf::from("/proc")));
+    }
+
+    #[test]
+    fn scan_dir_routes_configured_system_mounts_through_the_skip_branch() {
+        let tree = TempTree::new("system-mount");
+        let mount = tree.0.join("mounted");
+        fs::create_dir(&mount).unwrap();
+        tree.file("mounted/external.bin", 4096);
+        let root = tree.0.canonicalize().unwrap();
+        let mount = mount.canonicalize().unwrap();
+        let meta = fs::symlink_metadata(&root).unwrap();
+        let options = ScanOptions::default();
+        let progress = Progress::default();
+        let cancel = Cancel::new();
+        let ctx = Ctx {
+            options: &options,
+            progress: &progress,
+            cancel: &cancel,
+            root_device: device_of(&meta),
+            remote_mounts: Vec::new(),
+            system_mounts: vec![mount.clone()],
+            seen_links: Mutex::new(HashSet::new()),
+        };
+
+        let scanned = scan_dir(&root, &meta, 0, &ctx);
+        let skipped = scanned.resolve(&mount).unwrap();
+
+        assert_eq!(skipped.scan_state(), ScanState::Skipped);
+        assert!(skipped.children.is_empty());
+
+        let ordinary = root.join("ordinary");
+        fs::create_dir(&ordinary).unwrap();
+        tree.file("ordinary/local.bin", 1024);
+        let scanned = scan_dir(&root, &meta, 0, &ctx);
+        let skipped = scanned.resolve(&mount).unwrap();
+
+        assert_eq!(skipped.scan_state(), ScanState::Skipped);
+        assert!(skipped.children.is_empty());
+        assert!(scanned.resolve(&ordinary.join("local.bin")).is_some());
     }
 }

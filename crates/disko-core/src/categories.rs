@@ -432,7 +432,7 @@ fn walk(
                 path: path.to_path_buf(),
                 size: entry.size(kind),
                 rule,
-                last_used: entry.modified,
+                last_used: entry.modified(),
             });
         }
         return;
@@ -581,7 +581,7 @@ mod tests {
         let mut entry = DiskEntry::new(PathBuf::from(path), EntryType::Directory);
         entry.allocated_size = size;
         entry.apparent_size = size;
-        entry.modified = modified;
+        entry.set_modified(modified);
         entry.children = children;
         entry
     }

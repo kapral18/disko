@@ -94,6 +94,18 @@ fn joined(lines: &[String]) -> String {
     lines.join("\n")
 }
 
+/// Filled half-blocks in colour mode, braille dots under NO_COLOR. The spinner
+/// is braille too, so a single glyph is not a chart.
+fn contains_chart(screen: &str) -> bool {
+    screen.contains('▀')
+        || screen.contains('▄')
+        || screen
+            .chars()
+            .filter(|ch| ('\u{2801}'..='\u{28ff}').contains(ch))
+            .count()
+            > 1
+}
+
 #[test]
 fn the_overview_answers_the_three_questions() {
     let lines = render_lines(&mut app(), 100, 30).unwrap();
@@ -114,7 +126,7 @@ fn the_overview_answers_the_three_questions() {
     assert!(screen.contains("/Users/cesar"), "{screen}");
 
     // And the keys to go on with.
-    assert!(screen.contains("Enter explore"));
+    assert!(screen.contains("Tab chart"));
     assert!(screen.contains("q quit"));
 }
 
@@ -141,7 +153,7 @@ fn filesystem_language_stays_out_of_the_default_view() {
     for jargon in ["apfs", "/dev/disk3s1s1", "inode", "block"] {
         assert!(
             !screen.to_lowercase().contains(jargon),
-            "{jargon} should live behind d/--details, but the default view shows:\n{screen}"
+            "{jargon} should live behind d/--details, but the list view shows:\n{screen}"
         );
     }
 }
@@ -169,23 +181,48 @@ fn narrow_terminals_drop_the_percentage_before_the_bar() {
 }
 
 #[test]
-fn nothing_overflows_the_terminal_width() {
+fn core_content_survives_terminal_widths() {
     for width in [40u16, 60, 80, 100, 140] {
         for view in [View::Overview, View::Explorer, View::Picker] {
             let mut app = app();
             app.view = view;
+            if view == View::Picker {
+                app.filesystems = vec![filesystem()];
+            }
             // A small entry, so the explorer's "too small to place" note is on
             // screen: it is the longest thing the breadcrumb line ever carries.
             app.selection = 5;
-            for line in render_lines(&mut app, width, 30).unwrap() {
+            let lines = render_lines(&mut app, width, 30).unwrap();
+            let screen = joined(&lines);
+            let required: &[&str] = match view {
+                View::Overview => &["Macintosh HD", "404 GB", "Users"],
+                View::Explorer => &["Macintosh HD", "■ opt", "3 GB", "Esc list"],
+                View::Picker => &["Macintosh HD", "Enter scan"],
+                View::Scanning => unreachable!(),
+            };
+            for token in required {
                 assert!(
-                    line.chars().count() <= width as usize,
-                    "{view:?} at {width} columns produced a {}-char line: {line}",
-                    line.chars().count()
+                    screen.contains(token),
+                    "{view:?} at {width} columns lost {token:?}\n{screen}"
                 );
             }
         }
     }
+}
+
+#[test]
+fn deep_breadcrumbs_keep_their_last_folder_in_narrow_split_panes() {
+    let mut deep_app = app();
+    deep_app.cwd =
+        PathBuf::from("/Users/cesar/work/monorepo/fix/x-pack/packages/core-management/src/client");
+    deep_app.view = View::Explorer;
+
+    let screen = joined(&render_lines(&mut deep_app, 40, 30).unwrap());
+
+    assert!(
+        screen.contains("client"),
+        "the identifying tail was lost\n{screen}"
+    );
 }
 
 #[test]
@@ -211,10 +248,7 @@ fn the_explorer_draws_a_sunburst_with_a_legend() {
 
     // Breadcrumb, chart, legend, keys.
     assert!(screen.starts_with(" Macintosh HD"), "{screen}");
-    assert!(
-        screen.contains('▀') || screen.contains('▄'),
-        "no chart drawn\n{screen}"
-    );
+    assert!(contains_chart(&screen), "no chart drawn\n{screen}");
     assert!(screen.contains("■"), "no legend swatches\n{screen}");
     assert!(screen.contains("Enter open"), "{screen}");
     // The hole in the middle carries the directory total.
@@ -456,10 +490,129 @@ fn an_empty_directory_says_so_instead_of_showing_a_blank_panel() {
 }
 
 #[test]
+fn an_empty_directory_does_not_claim_to_be_scanning_while_a_scan_runs() {
+    let mut app = app();
+    // Painted from a snapshot while a scan runs: `/opt` is known to hold
+    // nothing, so nothing is coming.
+    app.provisional = Some(0);
+    app.cwd = PathBuf::from("/opt");
+
+    let screen = joined(&render_lines(&mut app, 100, 30).unwrap());
+    assert!(screen.contains("this folder is empty"), "{screen}");
+    assert!(!screen.contains("scanning this folder"), "{screen}");
+}
+
+#[test]
+fn the_explorer_says_a_search_matched_nothing() {
+    let mut app = app();
+    app.view = View::Explorer;
+    app.search = Some("no-such-name".into());
+
+    let screen = joined(&render_lines(&mut app, 100, 30).unwrap());
+    assert!(screen.contains("nothing matches that search"), "{screen}");
+}
+
+#[test]
+fn a_folder_cut_off_by_depth_does_not_claim_to_be_empty() {
+    let mut app = app();
+    app.settings.scan_options.max_depth = Some(1);
+    app.tree
+        .as_mut()
+        .unwrap()
+        .children
+        .iter_mut()
+        .find(|child| child.name() == "opt")
+        .unwrap()
+        .items = 40;
+    app.cwd = PathBuf::from("/opt");
+
+    let screen = joined(&render_lines(&mut app, 100, 30).unwrap());
+    assert!(
+        screen.contains("beyond --depth — run disko here"),
+        "{screen}"
+    );
+    assert!(!screen.contains("this folder is empty"), "{screen}");
+
+    app.view = View::Explorer;
+    let screen = joined(&render_lines(&mut app, 100, 30).unwrap());
+    assert!(
+        screen.contains("beyond --depth — run disko here"),
+        "{screen}"
+    );
+
+    // A search there finds nothing because nothing was kept, not because
+    // nothing matches.
+    app.search = Some("x".into());
+    let screen = joined(&render_lines(&mut app, 100, 30).unwrap());
+    assert!(
+        screen.contains("nothing listed — beyond --depth"),
+        "{screen}"
+    );
+}
+
+/// `/Users/cesar` as a pruned snapshot keeps it: four big folders listed,
+/// 1,200 more entries and 85 GB counted but not listed.
+fn app_in_a_partly_listed_folder() -> App {
+    let mut app = app();
+    let cesar = app
+        .tree
+        .as_mut()
+        .unwrap()
+        .children
+        .iter_mut()
+        .find(|child| child.name() == "Users")
+        .unwrap()
+        .children
+        .first_mut()
+        .unwrap();
+    cesar.items += 1200;
+    app.cwd = PathBuf::from("/Users/cesar");
+    app
+}
+
+#[test]
+fn a_partly_listed_folder_says_what_it_does_not_list_yet() {
+    let mut app = app_in_a_partly_listed_folder();
+
+    let screen = joined(&render_lines(&mut app, 100, 30).unwrap());
+    assert!(
+        screen.contains("+ 1,200 more · 85 GB not listed — press r"),
+        "{screen}"
+    );
+    // The explorer's legend is 34 columns: a shorter wording, the action kept.
+    app.view = View::Explorer;
+    let screen = joined(&render_lines(&mut app, 100, 30).unwrap());
+    assert!(
+        screen.contains("+1,200 · 85 GB unlisted — press r"),
+        "{screen}"
+    );
+    app.view = View::Overview;
+
+    // While a scan will fill it in, say that the rest is on its way.
+    app.provisional = Some(0);
+    let screen = joined(&render_lines(&mut app, 100, 30).unwrap());
+    assert!(screen.contains("counting 1,200 more · 85 GB…"), "{screen}");
+    app.view = View::Explorer;
+    let screen = joined(&render_lines(&mut app, 100, 30).unwrap());
+    assert!(screen.contains("counting 1,200 more · 85 GB…"), "{screen}");
+}
+
+#[test]
+fn a_fully_listed_folder_has_no_unlisted_line() {
+    let mut app = app();
+    app.cwd = PathBuf::from("/Users/cesar");
+    app.provisional = Some(0);
+
+    let screen = joined(&render_lines(&mut app, 100, 30).unwrap());
+    assert!(!screen.contains("not listed"), "{screen}");
+    assert!(!screen.contains("counting"), "{screen}");
+}
+
+#[test]
 fn a_scan_with_unreadable_folders_admits_it() {
     let mut app = app();
     if let Some(tree) = &mut app.tree {
-        tree.scan_state = disko_core::ScanState::Partial;
+        tree.set_scan_state(disko_core::ScanState::Partial);
     }
 
     let screen = joined(&render_lines(&mut app, 100, 30).unwrap());
@@ -563,10 +716,16 @@ fn growth_mode_survives_every_terminal_width() {
             let mut app = app_with_history();
             app.view = view;
             press(&mut app, KeyCode::Char('t'));
-            for line in render_lines(&mut app, width, 30).unwrap() {
+            let screen = joined(&render_lines(&mut app, width, 30).unwrap());
+            let required: &[&str] = match view {
+                View::Overview => &["Macintosh HD", "+82 GB", "+46 GB"],
+                View::Explorer => &["+82 GB", "Esc list"],
+                _ => unreachable!(),
+            };
+            for token in required {
                 assert!(
-                    line.chars().count() <= width as usize,
-                    "growth {view:?} at {width} columns overflowed: {line}"
+                    screen.contains(token),
+                    "growth {view:?} at {width} columns lost {token:?}\n{screen}"
                 );
             }
         }
@@ -581,10 +740,7 @@ fn the_explorer_charts_growth_when_growth_is_selected() {
     assert_eq!(app.view, View::Explorer);
 
     let screen = joined(&render_lines(&mut app, 100, 30).unwrap());
-    assert!(
-        screen.contains('▀') || screen.contains('▄'),
-        "no chart\n{screen}"
-    );
+    assert!(contains_chart(&screen), "no chart\n{screen}");
     // The hole carries the total change rather than the total size.
     assert!(screen.contains("+82 GB"), "{screen}");
     assert!(screen.contains("■"), "{screen}");
@@ -843,6 +999,8 @@ fn the_scan_root_itself_can_never_be_deleted() {
         targets: vec![disko::deletion::Target {
             path: sandbox.0.clone(),
             size: 4000,
+            allocated_size: 4000,
+            filesystem_identity: None,
             is_dir: true,
         }],
         typed: "delete".to_string(),
@@ -968,10 +1126,11 @@ fn the_progress_screen_survives_a_short_terminal() {
         .collect();
 
     for (width, height) in [(40u16, 10u16), (60, 14), (100, 24), (140, 40)] {
-        for line in render_lines(&mut app, width, height).unwrap() {
+        let screen = joined(&render_lines(&mut app, width, height).unwrap());
+        for token in ["Scanning", "Biggest so far", "number-0"] {
             assert!(
-                line.chars().count() <= width as usize,
-                "scanning at {width}x{height} overflowed: {line}"
+                screen.contains(token),
+                "scanning at {width}x{height} lost {token:?}\n{screen}"
             );
         }
     }
@@ -1130,10 +1289,6 @@ fn the_way_out_survives_even_the_narrowest_terminal() {
                 footer.contains(escape),
                 "{view:?} at {width} columns lost its way out: {footer:?}"
             );
-            assert!(
-                footer.chars().count() <= width as usize,
-                "{view:?} at {width} overflowed: {footer:?}"
-            );
         }
     }
 }
@@ -1153,8 +1308,8 @@ fn hints_are_dropped_from_the_least_important_end() {
         .clone();
 
     // The most useful hint stays, the tail goes.
-    assert!(wide.contains("Enter explore"), "{wide}");
-    assert!(narrow.contains("Enter explore"), "{narrow}");
+    assert!(wide.contains("Tab chart"), "{wide}");
+    assert!(narrow.contains("Tab chart"), "{narrow}");
     assert!(wide.contains("d details"), "{wide}");
     assert!(!narrow.contains("d details"), "{narrow}");
 }

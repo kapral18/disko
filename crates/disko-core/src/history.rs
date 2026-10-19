@@ -12,7 +12,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,10 @@ const STORAGE_DEPTH: usize = 8;
 /// and a small project keeps everything above 1 MB.
 const MIN_STORED_FRACTION: u64 = 10_000;
 const MIN_STORED_BYTES: u64 = 1_000_000;
+
+/// A snapshot's `.tmp` older than this was left by a write that never
+/// finished, and is removed.
+const ABANDONED_WRITE: Duration = Duration::from_secs(60 * 60);
 
 /// Snapshots kept per scanned root before the oldest are dropped.
 const RETAIN: usize = 64;
@@ -126,7 +130,13 @@ impl Store {
 
         let file = dir.join(format!("{taken_at}.json"));
         let json = serde_json::to_vec(&snapshot)?;
-        fs::write(&file, json).with_context(|| format!("cannot write {}", file.display()))?;
+        // Written aside and renamed into place: the TUI records from a thread
+        // of its own, and quitting in the middle must not leave a half-written
+        // snapshot for the next comparison to trip over. `list` ignores the
+        // `.tmp` name.
+        let partial = dir.join(format!("{taken_at}.json.tmp"));
+        fs::write(&partial, json).with_context(|| format!("cannot write {}", partial.display()))?;
+        fs::rename(&partial, &file).with_context(|| format!("cannot write {}", file.display()))?;
 
         self.prune(tree.root_path())?;
         Ok(snapshot)
@@ -219,6 +229,25 @@ impl Store {
     }
 
     fn prune(&self, scanned_root: &Path) -> Result<()> {
+        // A write cut short (quitting while a snapshot was being recorded)
+        // leaves its `.tmp` behind. One older than any write takes is not
+        // coming back; a younger one may be another disko still writing.
+        if let Ok(entries) = fs::read_dir(self.dir_for(scanned_root)) {
+            for entry in entries.filter_map(|entry| entry.ok()) {
+                let path = entry.path();
+                let abandoned = path.extension().is_some_and(|ext| ext == "tmp")
+                    && entry
+                        .metadata()
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > ABANDONED_WRITE);
+                if abandoned {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+
         let ids = self.list(scanned_root);
         if ids.len() <= RETAIN {
             return Ok(());

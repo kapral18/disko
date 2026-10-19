@@ -1,18 +1,21 @@
 //! The radial explorer: a sunburst of the current directory, with a legend
 //! tying every wedge to a name and a size.
 
+use std::sync::{Arc, Weak};
+
 use disko_core::size::{Unit, format};
-use disko_render::radial::{self, Drawn, LayoutOptions, RenderOptions, Segment};
+use disko_render::radial::{self, Drawn, RenderOptions};
 use disko_render::{BrailleCanvas, Canvas, Rgb, palette};
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Widget};
 
 use crate::model::Row;
 use crate::report::signed;
-use crate::tui::app::App;
+use crate::tui::app::{App, RadialCache};
 use crate::tui::text::{fit, truncate, width};
 use crate::tui::theme;
 
@@ -22,7 +25,120 @@ const RINGS: usize = 3;
 
 const LEGEND_WIDTH: u16 = 34;
 
-pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
+/// Only the chart pixels are cached; progress, labels and the legend stay live.
+#[derive(Default)]
+pub(super) struct ChartCache {
+    frame: Option<ChartFrame>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ChartKey {
+    width: u16,
+    height: u16,
+    no_color: bool,
+}
+
+struct ChartFrame {
+    // A weak reference keeps identity stable without retaining an old tree
+    // after App::touch hands its caches off to a background drop.
+    source: Weak<RadialCache>,
+    key: ChartKey,
+    pixels: ChartPixels,
+    selected: Option<usize>,
+    buffer: Buffer,
+    drawn: Drawn,
+}
+
+enum ChartPixels {
+    Color {
+        raster: radial::Raster,
+        canvas: Canvas,
+    },
+    Outline(BrailleCanvas),
+}
+
+impl ChartFrame {
+    fn new(source: &Arc<RadialCache>, key: ChartKey, selected: Option<usize>) -> Self {
+        let area = Rect::new(0, 0, key.width, key.height);
+        let pixels = if key.no_color {
+            ChartPixels::Outline(BrailleCanvas::new(key.width as usize, key.height as usize))
+        } else {
+            let canvas = Canvas::new(key.width as usize, key.height as usize);
+            let raster = radial::Raster::new(
+                &source.segments(None),
+                canvas.width(),
+                canvas.height(),
+                &RenderOptions {
+                    rings: RINGS,
+                    ..Default::default()
+                },
+            );
+            ChartPixels::Color { raster, canvas }
+        };
+        let mut frame = Self {
+            source: Arc::downgrade(source),
+            key,
+            pixels,
+            selected,
+            buffer: Buffer::empty(area),
+            drawn: Drawn::default(),
+        };
+        frame.select(source, selected);
+        frame
+    }
+
+    fn select(&mut self, source: &RadialCache, selected: Option<usize>) {
+        let segments = source.segments(selected);
+        self.buffer.reset();
+        self.drawn = match &mut self.pixels {
+            ChartPixels::Color { raster, canvas } => {
+                canvas.clear();
+                let drawn = raster.paint(&segments, canvas, selected);
+                color_cells(canvas, &mut self.buffer);
+                drawn
+            }
+            ChartPixels::Outline(canvas) => {
+                canvas.clear();
+                let drawn = radial::render_outline(
+                    &segments,
+                    canvas,
+                    &RenderOptions {
+                        rings: RINGS,
+                        selected,
+                        ..Default::default()
+                    },
+                );
+                let lines: Vec<_> = canvas.lines().into_iter().map(Line::from).collect();
+                Paragraph::new(lines).render(self.buffer.area, &mut self.buffer);
+                drawn
+            }
+        };
+        self.selected = selected;
+    }
+}
+
+fn color_cells(canvas: &Canvas, buffer: &mut Buffer) {
+    for (y, row) in buffer.content.chunks_exact_mut(canvas.width()).enumerate() {
+        for (x, cell) in row.iter_mut().enumerate() {
+            match (canvas.get(x, y * 2), canvas.get(x, y * 2 + 1)) {
+                (None, None) => {}
+                (Some(top), None) => {
+                    cell.set_symbol("▀").set_fg(theme::color(top));
+                }
+                (None, Some(bottom)) => {
+                    cell.set_symbol("▄").set_fg(theme::color(bottom));
+                }
+                (Some(top), Some(bottom)) => {
+                    cell.set_symbol("▀")
+                        .set_fg(theme::color(top))
+                        .set_bg(theme::color(bottom));
+                }
+            }
+        }
+    }
+}
+
+pub fn draw(frame: &mut Frame, area: Rect, app: &App, chart: &mut ChartCache, tick: usize) {
     let chunks = Layout::vertical([
         Constraint::Length(1), // breadcrumb
         Constraint::Length(1),
@@ -38,28 +154,69 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         .split(chunks[2]);
 
     let rows = app.rows();
-    let drawn = draw_chart(frame, body[0], app, &rows);
+    let drawn = draw_chart(frame, body[0], app, &rows, chart);
     if legend_width > 0 {
-        draw_legend(frame, body[1], app, &rows);
+        draw_legend(frame, body[1], app, &rows, tick);
     }
     draw_selection(frame, chunks[3], app, &rows);
 
     // The breadcrumb comes after the chart because what the chart could draw
     // decides what this line has to admit.
-    let mut crumbs = vec![Span::styled(app.breadcrumb(), theme::heading())];
-    if let Some(taken_at) = app.provisional {
+    let total_width = chunks[0].width as usize;
+    let mut right_span = None;
+    let mut right_len = 0;
+
+    if let Some(taken_at) = app.provisional_for_cwd() {
         let age = disko_core::history::now().saturating_sub(taken_at);
-        crumbs.push(Span::styled(
-            format!("   as of {} · rescanning…", crate::timefmt::ago(age)),
-            theme::warning(),
-        ));
+        let rescan_str = format!(
+            "as of {} · {} rescanning…",
+            crate::timefmt::ago(age),
+            theme::spinner(tick)
+        );
+        right_len = crate::tui::text::width(&rescan_str);
+        right_span = Some(Span::styled(rescan_str, theme::warning()));
+    } else if app.cwd_is_being_scanned() {
+        let rescan_str = format!("{} rescanning…", theme::spinner(tick));
+        right_len = crate::tui::text::width(&rescan_str);
+        right_span = Some(Span::styled(rescan_str, theme::warning()));
     }
+
+    let mut left_note = None;
+    let mut left_note_len = 0;
     if let Some(note) = note(app, &rows, drawn) {
-        crumbs.push(Span::styled(format!("   {note}"), theme::secondary()));
+        let note_str = format!("   {note}");
+        left_note_len = crate::tui::text::width(&note_str);
+        left_note = Some(Span::styled(note_str, theme::secondary()));
+    }
+
+    let gap = if right_span.is_some() { 2 } else { 0 };
+    let note_len = if total_width.saturating_sub(right_len + gap + left_note_len) >= 12 {
+        left_note_len
+    } else {
+        left_note = None;
+        0
+    };
+
+    let crumb_budget = total_width.saturating_sub(right_len + gap + note_len);
+    let crumb_text = crate::tui::text::shorten_breadcrumb(&app.breadcrumb_parts(), crumb_budget);
+    let crumb_len = crate::tui::text::width(&crumb_text);
+
+    let left_len = crumb_len + note_len;
+    let padding = total_width.saturating_sub(left_len + right_len);
+
+    let mut crumbs = vec![Span::styled(crumb_text, theme::heading())];
+    if let Some(n) = left_note {
+        crumbs.push(n);
+    }
+    if let Some(r) = right_span {
+        if padding > 0 {
+            crumbs.push(Span::raw(" ".repeat(padding)));
+        }
+        crumbs.push(r);
     }
     frame.render_widget(Paragraph::new(Line::from(crumbs)), chunks[0]);
 
-    crate::tui::footer::draw(frame, chunks[4], app, None);
+    crate::tui::footer::draw(frame, chunks[4], app, tick);
 }
 
 /// What the chart could not say for itself.
@@ -82,7 +239,13 @@ fn note(app: &App, rows: &[Row], drawn: Drawn) -> Option<String> {
     })
 }
 
-fn draw_chart(frame: &mut Frame, area: Rect, app: &App, rows: &[Row]) -> Drawn {
+fn draw_chart(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    rows: &[Row],
+    chart: &mut ChartCache,
+) -> Drawn {
     if area.width < 8 || area.height < 4 {
         return Drawn::default();
     }
@@ -96,79 +259,31 @@ fn draw_chart(frame: &mut Frame, area: Rect, app: &App, rows: &[Row]) -> Drawn {
         .and_then(|row| row.path.as_deref())
         .and_then(|path| cache.id_of(path));
 
-    let segments = radial::layout(
-        &cache.root,
-        &LayoutOptions {
-            rings: RINGS,
-            // Most of a big directory is slivers, and the row under the cursor
-            // is usually one of them. Place it regardless so the highlight has
-            // somewhere to land.
-            pinned: selected_id,
-            ..Default::default()
-        },
-    );
-
-    let options = RenderOptions {
-        rings: RINGS,
-        selected: selected_id,
-        ..Default::default()
+    let key = ChartKey {
+        width: area.width,
+        height: area.height,
+        no_color: theme::colors_disabled(),
     };
-
-    let (lines, drawn) = if theme::colors_disabled() {
-        outline_lines(&segments, area, &options)
-    } else {
-        color_lines(&segments, area, &options)
-    };
-
-    frame.render_widget(Paragraph::new(lines), area);
+    let cached = chart
+        .frame
+        .get_or_insert_with(|| ChartFrame::new(&cache, key, selected_id));
+    if cached.key != key || !cached.source.ptr_eq(&Arc::downgrade(&cache)) {
+        *cached = ChartFrame::new(&cache, key, selected_id);
+    } else if cached.selected != selected_id {
+        cached.select(&cache, selected_id);
+    }
+    let buffer = frame.buffer_mut();
+    for (y, row) in cached
+        .buffer
+        .content
+        .chunks_exact(area.width as usize)
+        .enumerate()
+    {
+        let start = buffer.index_of(area.x, area.y + y as u16);
+        buffer.content[start..start + row.len()].clone_from_slice(row);
+    }
     draw_hole(frame, area, app);
-    drawn
-}
-
-fn color_lines(
-    segments: &[Segment],
-    area: Rect,
-    options: &RenderOptions,
-) -> (Vec<Line<'static>>, Drawn) {
-    let mut canvas = Canvas::new(area.width as usize, area.height as usize);
-    let drawn = radial::render(segments, &mut canvas, options);
-
-    let lines = canvas
-        .cell_rows()
-        .into_iter()
-        .map(|row| {
-            Line::from(
-                row.into_iter()
-                    .map(|cell| match (cell.top, cell.bottom) {
-                        (None, None) => Span::raw(" "),
-                        (Some(top), None) => {
-                            Span::styled("▀", Style::default().fg(theme::color(top)))
-                        }
-                        (None, Some(bottom)) => {
-                            Span::styled("▄", Style::default().fg(theme::color(bottom)))
-                        }
-                        (Some(top), Some(bottom)) => Span::styled(
-                            "▀",
-                            Style::default()
-                                .fg(theme::color(top))
-                                .bg(theme::color(bottom)),
-                        ),
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect();
-    (lines, drawn)
-}
-
-fn outline_lines(
-    segments: &[Segment],
-    area: Rect,
-    options: &RenderOptions,
-) -> (Vec<Line<'static>>, Drawn) {
-    let mut canvas = BrailleCanvas::new(area.width as usize, area.height as usize);
-    let drawn = radial::render_outline(segments, &mut canvas, options);
-    (canvas.lines().into_iter().map(Line::from).collect(), drawn)
+    cached.drawn
 }
 
 /// The hole in the middle carries the total for the directory you are in —
@@ -218,7 +333,9 @@ fn draw_selection(frame: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
     }
 
     let growth = app.showing_growth();
-    let size = amount(row, growth, app.settings.unit);
+    let unit = app.settings.unit;
+    let size = amount(row, growth, unit);
+    let (_, scale) = app.legend_measure();
     // The swatch ties this line to the wedge and the legend row it repeats.
     let name = truncate(&row.name, total.saturating_sub(width(&size) + 5));
 
@@ -226,7 +343,7 @@ fn draw_selection(frame: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
         Paragraph::new(Line::from(vec![
             Span::styled(
                 "■ ",
-                Style::default().fg(theme::color(color_of(row, growth, scale(rows)))),
+                Style::default().fg(theme::color(color_of(row, growth, scale))),
             ),
             Span::styled(name, theme::heading()),
             Span::raw("   "),
@@ -236,26 +353,46 @@ fn draw_selection(frame: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
     );
 }
 
-fn draw_legend(frame: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
+fn draw_legend(frame: &mut Frame, area: Rect, app: &App, rows: &[Row], tick: usize) {
     let unit = app.settings.unit;
-    let capacity = area.height as usize;
-    if capacity == 0 || rows.is_empty() {
+    if area.height == 0 {
         return;
     }
+    if rows.is_empty() {
+        let message = truncate(
+            &crate::tui::overview::no_rows_message(app, tick),
+            area.width as usize,
+        );
+        frame.render_widget(Paragraph::new(Span::styled(message, theme::muted())), area);
+        return;
+    }
+
+    // The bottom line says what the legend does not list yet, as in the
+    // overview.
+    let mut area = area;
+    if area.height >= 2
+        && let Some(line) = crate::tui::overview::unlisted_line(app, tick, area.width as usize)
+    {
+        area.height -= 1;
+        let line_area = Rect {
+            y: area.y + area.height,
+            height: 1,
+            ..area
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(line, theme::warning())),
+            line_area,
+        );
+    }
+    let capacity = area.height as usize;
 
     // Keep the selection on screen when the legend is shorter than the list.
     let offset = app.selection.saturating_sub(capacity.saturating_sub(1));
     let visible = rows.iter().skip(offset).take(capacity);
 
     let growth = app.showing_growth();
-    let scale = scale(rows);
+    let (size_width, scale) = app.legend_measure();
     let amount = |row: &Row| amount(row, growth, unit);
-
-    let size_width = rows
-        .iter()
-        .map(|row| width(&amount(row)))
-        .max()
-        .unwrap_or(8);
     let name_width = (area.width as usize).saturating_sub(size_width + 5);
 
     let lines: Vec<Line> = visible
@@ -296,7 +433,18 @@ fn amount(row: &Row, growth: bool, unit: Unit) -> String {
     }
 }
 
-/// The biggest change on screen, which the growth colours are relative to.
+/// The legend's measure of every row: the widest amount, which the column is
+/// lined up to, and the biggest change, which growth colours are relative to.
+/// Both look at every row, so the app keeps them (`App::legend_measure`).
+pub(crate) fn measure(rows: &[Row], growth: bool, unit: Unit) -> (usize, i64) {
+    let size_width = rows
+        .iter()
+        .map(|row| width(&amount(row, growth, unit)))
+        .max()
+        .unwrap_or(8);
+    (size_width, scale(rows))
+}
+
 fn scale(rows: &[Row]) -> i64 {
     rows.iter()
         .map(|row| row.delta.unwrap_or(0).abs())

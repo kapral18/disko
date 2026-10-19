@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use disko_core::categories::{self, Group};
-use disko_core::history::{self, Store};
+use disko_core::history::{self, Snapshot, SnapshotId, Store};
 use disko_core::scan::{self, Cancel, Progress};
-use disko_core::{Diff, DiskEntry, SizeKind};
+use disko_core::{Diff, DiskEntry, PublicTree, SizeKind};
+use serde::Serialize;
 
 use crate::cli::Options;
 use crate::model::display_path;
@@ -221,8 +222,8 @@ fn remove(
                 continue;
             }
             match crate::deletion::delete(path) {
-                Ok(()) => {
-                    freed += group.size / group.paths.len().max(1) as u64;
+                Ok(removed_bytes) => {
+                    freed = freed.saturating_add(removed_bytes);
                     writeln!(out, " removed {}", display_path(path))?;
                 }
                 Err(error) => {
@@ -264,7 +265,8 @@ pub fn history(
     let snapshots = store.load_all(&root);
 
     if options.json {
-        serde_json::to_writer_pretty(&mut *out, &snapshots)?;
+        let public: Vec<PublicSnapshot> = snapshots.iter().map(PublicSnapshot::from).collect();
+        serde_json::to_writer_pretty(&mut *out, &public)?;
         writeln!(out)?;
         return Ok(());
     }
@@ -279,34 +281,67 @@ pub fn history(
     )
 }
 
+/// A [`Snapshot`], for `history --json`: its tree goes through [`PublicTree`].
+#[derive(Serialize)]
+struct PublicSnapshot<'a> {
+    root: &'a Path,
+    taken_at: u64,
+    total_allocated: u64,
+    total_apparent: u64,
+    items: u64,
+    floor: u64,
+    tree: PublicTree<'a>,
+}
+
+impl<'a> From<&'a Snapshot> for PublicSnapshot<'a> {
+    fn from(snapshot: &'a Snapshot) -> Self {
+        Self {
+            root: &snapshot.root,
+            taken_at: snapshot.taken_at,
+            total_allocated: snapshot.total_allocated,
+            total_apparent: snapshot.total_apparent,
+            items: snapshot.items,
+            floor: snapshot.floor,
+            tree: PublicTree(&snapshot.tree),
+        }
+    }
+}
+
 /// The last thing disko knew about `path`, for painting a screen before the
 /// fresh scan has finished.
 pub fn last_snapshot(path: &Path) -> Option<disko_core::Snapshot> {
     Store::open().ok()?.latest(path)
 }
 
-/// Compare a fresh scan against the last snapshot, then record it.
+/// Store `tree` as the newest snapshot of its root (when `record`), and hand
+/// back the store with the one that was newest before it, which a comparison
+/// needs.
 ///
-/// Order matters: recording first would leave the newest snapshot equal to the
-/// scan being compared, and every diff would come back empty.
-pub fn record_and_diff(tree: &DiskEntry, kind: SizeKind, record: bool) -> Option<Diff> {
+/// Only the old one's name is read before writing — the other way round, the
+/// newest snapshot would be the scan itself and every comparison against it
+/// would come back empty. Parsing it can wait until the new one is safe, which
+/// is also why this one is never written over it: a scan recorded within the
+/// same second as the last gets the next second.
+pub fn record_snapshot(tree: &DiskEntry, record: bool) -> Option<(Store, SnapshotId)> {
     let store = Store::open().ok()?;
-    let now = history::now();
-    let previous = store.latest(tree.root_path());
-
+    let previous = store.list(tree.root_path()).pop();
     if record {
-        let _ = store.record(tree);
+        let after_previous = previous.as_ref().map_or(0, |id| id.taken_at + 1);
+        let _ = store.record_at(tree, history::now().max(after_previous));
     }
+    Some((store, previous?))
+}
 
-    let previous = previous?;
-    Some(disko_core::diff::diff(
+/// What changed between `previous` and `tree`, measured in `kind`.
+pub fn diff_since(previous: &Snapshot, tree: &DiskEntry, kind: SizeKind) -> Diff {
+    disko_core::diff::diff(
         &previous.tree,
         tree,
         kind,
         previous.taken_at,
-        now,
+        history::now(),
         previous.floor,
-    ))
+    )
 }
 
 fn home() -> Option<PathBuf> {
@@ -377,6 +412,66 @@ mod tests {
         assert!(text.contains("Freed 0 B"), "{text}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn deletion_reports_actual_removed_bytes_not_the_group_estimate() {
+        use std::os::unix::fs::MetadataExt;
+
+        fn allocated(path: &Path) -> u64 {
+            let meta = std::fs::symlink_metadata(path).unwrap();
+            let own = meta.blocks() * 512;
+            if meta.is_dir() {
+                own + std::fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| allocated(&entry.unwrap().path()))
+                    .sum::<u64>()
+            } else {
+                own
+            }
+        }
+
+        let rule = disko_core::categories::RULES
+            .iter()
+            .find(|rule| rule.id == "rust-target")
+            .unwrap();
+        let base =
+            std::env::temp_dir().join(format!("disko-clean-actual-freed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let target = base.join("project/target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(base.join("project/Cargo.toml"), b"[package]").unwrap();
+        std::fs::write(target.join("blob.bin"), b"temporary").unwrap();
+        let actual = allocated(&target);
+        let estimate = actual.saturating_add(1_000_000_000);
+        let groups = vec![Group {
+            rule,
+            size: estimate,
+            last_used: 0,
+            paths: vec![target.as_path()],
+        }];
+        let options = options();
+
+        let mut out = Vec::new();
+        remove(&mut out, &groups, &options, true).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(&format!(
+                "Freed {}",
+                disko_core::size::format(actual, options.unit())
+            )),
+            "{text}"
+        );
+        assert!(
+            !text.contains(&format!(
+                "Freed {}",
+                disko_core::size::format(estimate, options.unit())
+            )),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn diffing_without_any_history_explains_what_to_do() {
         let mut out = Vec::new();
@@ -396,5 +491,31 @@ mod tests {
         entry.allocated_size = 10;
         // Just proving the shape the store wants is the shape a scan gives.
         assert_eq!(disko_core::history::storage_floor(&entry), 1_000_000);
+    }
+
+    #[test]
+    fn history_json_omits_the_private_aggregate_fields() {
+        let mut tree = DiskEntry::new(PathBuf::from("/root"), EntryType::Directory);
+        tree.allocated_size = 1000;
+        tree.apparent_size = 1000;
+        let snapshot = Snapshot {
+            root: PathBuf::from("/root"),
+            taken_at: 1,
+            total_allocated: 1000,
+            total_apparent: 1000,
+            items: 1,
+            floor: 0,
+            tree,
+        };
+
+        let public = vec![PublicSnapshot::from(&snapshot)];
+        let text = serde_json::to_string(&public).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(parsed[0]["root"], "/root");
+        assert_eq!(parsed[0]["taken_at"], 1);
+        assert_eq!(parsed[0]["tree"]["allocated_size"], 1000);
+        assert!(parsed[0]["tree"].get("own_modified").is_none());
+        assert!(parsed[0]["tree"].get("own_scan_state").is_none());
     }
 }

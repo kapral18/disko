@@ -72,9 +72,16 @@ pub struct DiskEntry {
     /// Unix epoch. This is what answers "when was this last actually used" —
     /// a 30 GB cache nobody has touched in four months is a very different
     /// proposition from one that is warm.
-    pub modified: u64,
+    modified: u64,
+    /// This entry's modification time before child aggregates are folded in.
+    own_modified: u64,
     pub children: Vec<DiskEntry>,
-    pub scan_state: ScanState,
+    scan_state: ScanState,
+    /// This entry's scan result before child states are folded in.
+    own_scan_state: ScanState,
+    /// Filesystem identity captured by the scanner. It is runtime safety
+    /// state, not part of snapshots or public JSON.
+    filesystem_identity: Option<(u64, u64)>,
 }
 
 impl DiskEntry {
@@ -88,8 +95,11 @@ impl DiskEntry {
             entry_type,
             items: 1,
             modified: 0,
+            own_modified: 0,
             children: Vec::new(),
             scan_state: ScanState::Complete,
+            own_scan_state: ScanState::Complete,
+            filesystem_identity: None,
         }
     }
 
@@ -131,9 +141,44 @@ impl DiskEntry {
             entry_type: self.entry_type,
             items: self.items,
             modified: self.modified,
+            own_modified: self.own_modified,
             children: Vec::new(),
             scan_state: self.scan_state,
+            own_scan_state: self.own_scan_state,
+            filesystem_identity: self.filesystem_identity,
         }
+    }
+
+    pub fn modified(&self) -> u64 {
+        self.modified
+    }
+
+    pub fn set_modified(&mut self, modified: u64) {
+        self.own_modified = modified;
+        self.modified = modified.max(
+            self.children
+                .iter()
+                .map(|child| child.modified)
+                .max()
+                .unwrap_or(0),
+        );
+    }
+
+    pub fn scan_state(&self) -> ScanState {
+        self.scan_state
+    }
+
+    pub fn set_scan_state(&mut self, scan_state: ScanState) {
+        self.own_scan_state = scan_state;
+        self.recompute_metadata();
+    }
+
+    pub fn filesystem_identity(&self) -> Option<(u64, u64)> {
+        self.filesystem_identity
+    }
+
+    pub(crate) fn set_filesystem_identity(&mut self, identity: Option<(u64, u64)>) {
+        self.filesystem_identity = identity;
     }
 
     pub fn size(&self, kind: SizeKind) -> u64 {
@@ -164,11 +209,40 @@ impl DiskEntry {
         self.children.iter().find(|c| c.name_os() == name)
     }
 
+    /// `path` relative to this entry, or `None` when it lives elsewhere.
+    /// Handles prefix aliases (like `/var` vs `/private/var` on macOS).
+    fn relative_path<'a>(&self, path: &'a Path) -> Option<&'a Path> {
+        if let Ok(relative) = path.strip_prefix(self.root_path()) {
+            return Some(relative);
+        }
+
+        // macOS exposes /var, /tmp, and /etc both with and without `/private`
+        // while canonicalisation stores the `/private` form in the scan tree.
+        #[cfg(target_os = "macos")]
+        if let Ok(alias_root) = self.root_path().strip_prefix("/private")
+            && alias_root.components().next().is_some_and(|component| {
+                matches!(component.as_os_str().to_str(), Some("var" | "tmp" | "etc"))
+            })
+            && let Ok(relative) = path.strip_prefix(Path::new("/").join(alias_root))
+        {
+            return Some(relative);
+        }
+        None
+    }
+
+    /// The child names under this entry that lead to `path`, for the mutating
+    /// walks that recurse on a slice. `resolve` runs every frame and iterates
+    /// the components directly instead.
+    fn relative_components<'a>(&self, path: &'a Path) -> Option<Vec<&'a OsStr>> {
+        let relative = self.relative_path(path)?;
+        Some(relative.components().map(|c| c.as_os_str()).collect())
+    }
+
     /// Walk down to `path`, which must live under this entry. Returns `None`
     /// if any component is missing (a file that was deleted mid-session, or a
     /// subtree the depth limit pruned).
     pub fn resolve(&self, path: &Path) -> Option<&DiskEntry> {
-        let relative = path.strip_prefix(self.root_path()).ok()?;
+        let relative = self.relative_path(path)?;
         let mut node = self;
         for component in relative.components() {
             node = node.child_named(component.as_os_str())?;
@@ -184,8 +258,10 @@ impl DiskEntry {
     /// to build.
     pub fn remove(&mut self, path: &Path) -> Option<DiskEntry> {
         // A tree cannot remove itself, and nothing outside it is its business.
-        let relative = path.strip_prefix(self.root_path()).ok()?;
-        let names: Vec<&OsStr> = relative.components().map(|c| c.as_os_str()).collect();
+        let names = self.relative_components(path)?;
+        if names.is_empty() {
+            return None;
+        }
         self.remove_named(&names)
     }
 
@@ -207,6 +283,79 @@ impl DiskEntry {
         self.apparent_size = self.apparent_size.saturating_sub(child.apparent_size);
         self.allocated_size = self.allocated_size.saturating_sub(child.allocated_size);
         self.items = self.items.saturating_sub(child.items);
+        self.recompute_metadata();
+    }
+
+    fn recompute_metadata(&mut self) {
+        self.modified = self
+            .children
+            .iter()
+            .map(|child| child.modified)
+            .fold(self.own_modified, u64::max);
+        self.scan_state = self
+            .children
+            .iter()
+            .fold(self.own_scan_state, |state, child| {
+                state.merge(child.scan_state)
+            });
+    }
+
+    /// Graft `subtree` into this tree at `path`, adjusting the totals of every
+    /// ancestor along the way.
+    ///
+    /// Hard-link dedup is per scan, so a file linked from both inside and
+    /// outside `subtree` that the original scan credited elsewhere is counted
+    /// again here; ancestor totals can exceed the disk by that much until the
+    /// next full rescan. Carrying the original inode set over would not fix it:
+    /// links the original scan credited *inside* the subtree would then be
+    /// dropped instead.
+    ///
+    /// Hands back the entry it replaced, or `subtree` itself when `path` is
+    /// not in this tree, so the caller decides where a big tree is freed.
+    pub fn graft(&mut self, path: &Path, subtree: DiskEntry) -> Result<DiskEntry, DiskEntry> {
+        let Some(names) = self.relative_components(path) else {
+            return Err(subtree);
+        };
+        if names.is_empty() {
+            return Ok(std::mem::replace(self, subtree));
+        }
+        self.graft_named(&names, subtree)
+    }
+
+    fn graft_named(
+        &mut self,
+        names: &[&OsStr],
+        mut subtree: DiskEntry,
+    ) -> Result<DiskEntry, DiskEntry> {
+        let Some((name, rest)) = names.split_first() else {
+            return Err(subtree);
+        };
+        let Some(index) = self.children.iter().position(|c| c.name_os() == *name) else {
+            return Err(subtree);
+        };
+
+        let child = &mut self.children[index];
+        let (old_apparent, old_allocated, old_items) =
+            (child.apparent_size, child.allocated_size, child.items);
+        let replaced = if rest.is_empty() {
+            subtree.name = child.name.clone();
+            std::mem::replace(child, subtree)
+        } else {
+            child.graft_named(rest, subtree)?
+        };
+
+        let (apparent, allocated, items) = (child.apparent_size, child.allocated_size, child.items);
+        self.apparent_size = self
+            .apparent_size
+            .saturating_sub(old_apparent)
+            .saturating_add(apparent);
+        self.allocated_size = self
+            .allocated_size
+            .saturating_sub(old_allocated)
+            .saturating_add(allocated);
+        self.items = self.items.saturating_sub(old_items).saturating_add(items);
+        self.recompute_metadata();
+        Ok(replaced)
     }
 
     /// Sorts every level largest-first. The TUI re-sorts by other keys itself;
@@ -272,24 +421,29 @@ impl DiskEntry {
     }
 }
 
+pub use wire::PublicTree;
+
 /// Every format disko publishes — `--json` and the snapshots behind `diff` —
 /// gives each entry its full path, and did so before entries stopped carrying
-/// one. Serialising rebuilds those paths on the way down and parsing takes them
-/// apart again, so the shape on the wire is exactly what it always was.
+/// one. Serialising rebuilds those paths on the way down. The private aggregate
+/// inputs are additive fields; their defaults keep older snapshots readable.
 mod wire {
     use super::*;
     use serde::de::Deserializer;
     use serde::ser::{SerializeSeq, SerializeStruct, Serializer};
 
-    /// An entry together with the path that reached it.
+    /// An entry together with the path that reached it. `public` leaves out
+    /// the private aggregate inputs; see [`PublicTree`].
     struct Pathed<'a> {
         path: &'a Path,
         entry: &'a DiskEntry,
+        public: bool,
     }
 
     struct Children<'a> {
         base: &'a Path,
         entries: &'a [DiskEntry],
+        public: bool,
     }
 
     impl Serialize for Children<'_> {
@@ -299,7 +453,11 @@ mod wire {
                 // Transient: one path at a time, dropped before the next, so
                 // writing a two-million entry tree still holds only one copy.
                 let path = self.base.join(entry.name_os());
-                seq.serialize_element(&Pathed { path: &path, entry })?;
+                seq.serialize_element(&Pathed {
+                    path: &path,
+                    entry,
+                    public: self.public,
+                })?;
             }
             seq.end()
         }
@@ -308,21 +466,29 @@ mod wire {
     impl Serialize for Pathed<'_> {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             let entry = self.entry;
-            let mut out = serializer.serialize_struct("DiskEntry", 8)?;
+            let field_count = if self.public { 8 } else { 10 };
+            let mut out = serializer.serialize_struct("DiskEntry", field_count)?;
             out.serialize_field("path", self.path)?;
             out.serialize_field("apparent_size", &entry.apparent_size)?;
             out.serialize_field("allocated_size", &entry.allocated_size)?;
             out.serialize_field("entry_type", &entry.entry_type)?;
             out.serialize_field("items", &entry.items)?;
             out.serialize_field("modified", &entry.modified)?;
+            if !self.public {
+                out.serialize_field("own_modified", &entry.own_modified)?;
+            }
             out.serialize_field(
                 "children",
                 &Children {
                     base: self.path,
                     entries: &entry.children,
+                    public: self.public,
                 },
             )?;
             out.serialize_field("scan_state", &entry.scan_state)?;
+            if !self.public {
+                out.serialize_field("own_scan_state", &entry.own_scan_state)?;
+            }
             out.end()
         }
     }
@@ -335,6 +501,25 @@ mod wire {
             Pathed {
                 path: self.root_path(),
                 entry: self,
+                public: false,
+            }
+            .serialize(serializer)
+        }
+    }
+
+    /// The same tree, for the formats a person reads (`disko --json`,
+    /// `disko history --json`). It leaves out `own_modified` and
+    /// `own_scan_state`, which only exist so `remove` and `graft` can
+    /// recompute aggregates. Snapshots go through [`DiskEntry`]'s own
+    /// `Serialize` impl, which keeps them.
+    pub struct PublicTree<'a>(pub &'a DiskEntry);
+
+    impl Serialize for PublicTree<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            Pathed {
+                path: self.0.root_path(),
+                entry: self.0,
+                public: true,
             }
             .serialize(serializer)
         }
@@ -349,8 +534,12 @@ mod wire {
         items: u64,
         #[serde(default)]
         modified: u64,
+        #[serde(default)]
+        own_modified: Option<u64>,
         children: Vec<Wire>,
         scan_state: ScanState,
+        #[serde(default)]
+        own_scan_state: Option<ScanState>,
     }
 
     impl Wire {
@@ -361,6 +550,23 @@ mod wire {
                 Some(name) if !is_root => name.to_os_string(),
                 _ => self.path.into_os_string(),
             };
+            let children: Vec<DiskEntry> = self
+                .children
+                .into_iter()
+                .map(|child| child.into_entry(false))
+                .collect();
+            // Snapshots written before `own_modified` stored only the subtree
+            // maximum, which is never older than any child. Taking it as the
+            // directory's own keeps the recorded aggregate exactly; the
+            // directory's real mtime is not in the file.
+            let own_modified = self.own_modified.unwrap_or(self.modified);
+            let own_scan_state = self.own_scan_state.unwrap_or({
+                if children.is_empty() {
+                    self.scan_state
+                } else {
+                    ScanState::Complete
+                }
+            });
             DiskEntry {
                 name: name.into_boxed_os_str(),
                 apparent_size: self.apparent_size,
@@ -368,12 +574,11 @@ mod wire {
                 entry_type: self.entry_type,
                 items: self.items,
                 modified: self.modified,
-                children: self
-                    .children
-                    .into_iter()
-                    .map(|child| child.into_entry(false))
-                    .collect(),
+                own_modified,
+                children,
                 scan_state: self.scan_state,
+                own_scan_state,
+                filesystem_identity: None,
             }
         }
     }
@@ -516,6 +721,23 @@ mod tests {
         assert_eq!(json["allocated_size"], 40);
         assert_eq!(json["entry_type"], "directory");
         assert_eq!(json["children"][0]["children"][0]["entry_type"], "file");
+        assert_eq!(json["own_modified"], 0);
+        assert_eq!(json["own_scan_state"], "complete");
+    }
+
+    #[test]
+    fn public_tree_drops_the_private_aggregate_fields() {
+        let json: serde_json::Value = serde_json::to_value(PublicTree(&named_tree())).unwrap();
+
+        // The public view (`disko --json`) still carries every path and size...
+        assert_eq!(json["path"], "/root");
+        assert_eq!(json["children"][0]["path"], "/root/a");
+        assert_eq!(json["allocated_size"], 40);
+        // ...but not the internal aggregate inputs, at any depth.
+        assert!(json.get("own_modified").is_none());
+        assert!(json.get("own_scan_state").is_none());
+        assert!(json["children"][0].get("own_modified").is_none());
+        assert!(json["children"][0].get("own_scan_state").is_none());
     }
 
     #[test]
@@ -531,6 +753,40 @@ mod tests {
             "deep.txt"
         );
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn a_round_trip_keeps_the_metadata_needed_for_later_removal() {
+        let mut root = DiskEntry::new("/root", EntryType::Directory);
+        root.set_modified(10);
+        root.set_scan_state(ScanState::Complete);
+        let mut child = DiskEntry::new("child", EntryType::Directory);
+        child.set_modified(10);
+        child.set_scan_state(ScanState::Denied);
+        root.absorb(&child);
+        root.children.push(child);
+
+        let json = serde_json::to_string(&root).unwrap();
+        let mut back: DiskEntry = serde_json::from_str(&json).unwrap();
+        back.remove(Path::new("/root/child")).unwrap();
+
+        assert_eq!(back.modified(), 10);
+        assert_eq!(back.scan_state(), ScanState::Complete);
+    }
+
+    #[test]
+    fn a_round_trip_keeps_a_parents_own_incomplete_scan_state() {
+        let mut root = DiskEntry::new("/root", EntryType::Directory);
+        root.set_scan_state(ScanState::Denied);
+        let child = DiskEntry::new("child", EntryType::Directory);
+        root.absorb(&child);
+        root.children.push(child);
+
+        let json = serde_json::to_string(&root).unwrap();
+        let mut back: DiskEntry = serde_json::from_str(&json).unwrap();
+        back.remove(Path::new("/root/child")).unwrap();
+
+        assert_eq!(back.scan_state(), ScanState::Denied);
     }
 
     #[test]
@@ -560,16 +816,156 @@ mod tests {
         let tree: DiskEntry = serde_json::from_str(stored).unwrap();
         assert_eq!(tree.root_path(), Path::new("/root"));
         assert_eq!(tree.allocated_size, 40);
-        assert_eq!(tree.modified, 0);
+        assert_eq!(tree.modified(), 0);
         assert_eq!(tree.resolve(Path::new("/root/a")).unwrap().items, 2);
+    }
+
+    #[test]
+    fn an_old_snapshot_keeps_parent_scan_state_separate_from_children() {
+        let stored = r#"{
+            "path": "/root",
+            "apparent_size": 40,
+            "allocated_size": 40,
+            "entry_type": "directory",
+            "items": 2,
+            "modified": 10,
+            "children": [
+                {
+                    "path": "/root/denied",
+                    "apparent_size": 0,
+                    "allocated_size": 0,
+                    "entry_type": "directory",
+                    "items": 1,
+                    "modified": 0,
+                    "children": [],
+                    "scan_state": "denied"
+                }
+            ],
+            "scan_state": "partial"
+        }"#;
+
+        let mut tree: DiskEntry = serde_json::from_str(stored).unwrap();
+        tree.remove(Path::new("/root/denied")).unwrap();
+
+        assert_eq!(tree.modified(), 10);
+        assert_eq!(tree.scan_state(), ScanState::Complete);
     }
 
     #[test]
     fn scan_state_degrades_to_partial() {
         let mut parent = DiskEntry::new(PathBuf::from("/p"), EntryType::Directory);
         let mut denied = DiskEntry::new(PathBuf::from("/p/c"), EntryType::Directory);
-        denied.scan_state = ScanState::Denied;
+        denied.set_scan_state(ScanState::Denied);
         parent.absorb(&denied);
-        assert_eq!(parent.scan_state, ScanState::Partial);
+        assert_eq!(parent.scan_state(), ScanState::Partial);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_and_remove_handle_prefix_mismatches() {
+        let mut tree = DiskEntry::new(PathBuf::from("/private/var/root"), EntryType::Directory);
+        let mut child = DiskEntry::new("logs", EntryType::Directory);
+        child.allocated_size = 100;
+        tree.children.push(child);
+        tree.allocated_size = 100;
+
+        // Path with display prefix /var/root/logs instead of /private/var/root/logs
+        let display_path = Path::new("/var/root/logs");
+        assert!(tree.resolve(display_path).is_some());
+
+        let removed = tree.remove(display_path);
+        assert!(removed.is_some());
+        assert_eq!(tree.allocated_size, 0);
+        assert!(tree.children.is_empty());
+    }
+
+    #[test]
+    fn private_prefix_is_not_a_generic_alias() {
+        let mut tree = DiskEntry::new(PathBuf::from("/private/custom"), EntryType::Directory);
+        tree.children
+            .push(DiskEntry::new("entry", EntryType::Directory));
+
+        assert!(tree.resolve(Path::new("/custom/entry")).is_none());
+        assert!(tree.remove(Path::new("/custom/entry")).is_none());
+        assert_eq!(tree.children.len(), 1);
+    }
+
+    #[test]
+    fn graft_replaces_subtree_and_updates_ancestor_totals() {
+        let mut tree = DiskEntry::new(PathBuf::from("/root"), EntryType::Directory);
+        let mut sub = DiskEntry::new("sub", EntryType::Directory);
+        sub.allocated_size = 50;
+        sub.apparent_size = 50;
+        sub.items = 1;
+        tree.children.push(sub);
+        tree.allocated_size = 50;
+        tree.apparent_size = 50;
+        tree.items = 2;
+
+        let mut deep_sub = DiskEntry::new(PathBuf::from("/root/sub"), EntryType::Directory);
+        let mut file1 = DiskEntry::new("file1", EntryType::File);
+        file1.allocated_size = 80;
+        file1.apparent_size = 80;
+        file1.items = 1;
+        deep_sub.children.push(file1);
+        deep_sub.allocated_size = 80;
+        deep_sub.apparent_size = 80;
+        deep_sub.items = 2;
+
+        assert!(tree.graft(Path::new("/root/sub"), deep_sub).is_ok());
+        assert_eq!(tree.allocated_size, 80);
+        assert_eq!(tree.apparent_size, 80);
+        assert_eq!(tree.items, 3);
+        assert_eq!(
+            tree.resolve(Path::new("/root/sub/file1"))
+                .unwrap()
+                .allocated_size,
+            80
+        );
+    }
+
+    #[test]
+    fn graft_recomputes_ancestor_metadata_from_current_children() {
+        let mut root = DiskEntry::new("/root", EntryType::Directory);
+        root.set_modified(10);
+        let mut old = DiskEntry::new("child", EntryType::Directory);
+        old.set_modified(100);
+        old.set_scan_state(ScanState::Denied);
+        root.absorb(&old);
+        root.children.push(old);
+
+        let mut replacement = DiskEntry::new("child", EntryType::Directory);
+        replacement.set_modified(20);
+
+        assert!(root.graft(Path::new("/root/child"), replacement).is_ok());
+        assert_eq!(root.modified(), 20);
+        assert_eq!(root.scan_state(), ScanState::Complete);
+    }
+
+    #[test]
+    fn graft_totals_saturate_without_signed_wraparound() {
+        let mut root = DiskEntry::new("/root", EntryType::Directory);
+        let mut child = DiskEntry::new("child", EntryType::Directory);
+        child.children.push(DiskEntry::new("leaf", EntryType::File));
+        child.allocated_size = 1;
+        child.apparent_size = 1;
+        child.items = 2;
+        root.children.push(child);
+        root.allocated_size = 2;
+        root.apparent_size = 2;
+        root.items = 3;
+
+        let mut replacement = DiskEntry::new("leaf", EntryType::File);
+        replacement.allocated_size = u64::MAX;
+        replacement.apparent_size = u64::MAX;
+        replacement.items = u64::MAX;
+
+        assert!(
+            root.graft(Path::new("/root/child/leaf"), replacement)
+                .is_ok()
+        );
+        assert_eq!(root.allocated_size, u64::MAX);
+        assert_eq!(root.apparent_size, u64::MAX);
+        assert_eq!(root.items, u64::MAX);
     }
 }

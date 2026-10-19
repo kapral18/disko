@@ -204,11 +204,11 @@ only counts as build output when a `Cargo.toml` sits beside it.
 ```bash
 disko              # pick a disk, then explore it
 disko ~            # scan your home directory right away
-disko / --top 20   # the 20 largest things on the root filesystem
+disko / --top 20   # limit the list view to the 20 largest entries
 ```
 
-The default screen answers three questions and nothing else — what is full,
-what is using the space, where to look next:
+Disks open in the radial chart by default. Use `l` / `→` to open a folder
+and `h` / `←` to go up. Press `Tab` to switch between the chart and this list:
 
 ```text
  Macintosh HD                                      404 GB used of 494 GB
@@ -226,13 +226,16 @@ what is using the space, where to look next:
    32 GB   ~/code
 ```
 
-Press `Enter` for a DaisyDisk-style sunburst you can walk into.
+Your chosen view stays in place across scans and disk changes. It is saved
+when you quit and restored next time.
 
 | Key | Does |
 | --- | --- |
-| `↑` `↓` | move the selection |
+| `j` `k` / `↓` `↑` | move the selection |
+| `Tab` | switch between chart and list |
 | `Enter` | open the radial explorer (and drill in, once there) |
-| `→` `←` | open the selected folder / go back up |
+| `l` `→` / `h` `←` `Backspace` | open the selected folder / go back up |
+| `Esc` | close details or search, then return from chart to list |
 | **`t`** | **switch between size and growth** |
 | `/` | filter the list as you type |
 | `s` | cycle sort: size, name, item count |
@@ -242,8 +245,31 @@ Press `Enter` for a DaisyDisk-style sunburst you can walk into.
 | `y` `c` | copy the selected path to the clipboard |
 | `Space` | mark an entry; the footer totals what you marked |
 | **`x`** | **delete what is marked** (or the selection), after confirmation |
-| `r` | rescan |
+| `r` | rescan current directory |
+| `R` | rescan from root |
+| `z` | stop a background rescan |
 | `q` | quit |
+
+`r`, `R`, and the automatic rescan after a deletion (below) run in the
+background, and the list stays interactive. Press `z` to stop one. A stopped
+folder rescan leaves the folder as it was, except folders you opened while it
+ran (below). A stopped whole-tree rescan shows what it counted so far, marked
+incomplete, with no growth comparison; if it never listed the folder you are
+in, you are moved up to the nearest one it did. A `z` that comes after a
+whole-tree rescan has finished counting stops nothing: disko says it is
+finishing, and the full result lands, with its comparison if there is one.
+Quitting right then waits until that scan's snapshot is saved (`q` again
+skips it). A folder disko did not fully list says so ("not fully counted —
+press r", or "beyond --depth" at the depth limit) instead of looking empty.
+
+While a scan runs you can keep going deeper than the numbers on screen
+reach: opening a folder under what it covers that is listed only in part — or
+not at all — scans that folder first, on threads of its own, and fills it in
+as soon as it is counted. The scan carries on and replaces those numbers when
+it finishes. Until a folder lists everything it holds, the line under its
+entries says how much is missing and whether it is being counted
+(`⠋ counting 1,200 more · 85 GB…`), so entries that appear later are no
+surprise.
 
 ### Deleting
 
@@ -284,7 +310,15 @@ reached. Every path
 is re-checked against the filesystem immediately before removal, so disko will
 refuse the scan root, anything outside the current scan, a mount point, or
 something that has vanished since the scan. Symlinks are unlinked, never
-followed into. Totals correct themselves instantly, without a rescan.
+followed into.
+
+Totals usually correct themselves instantly, by subtracting what was removed.
+When a deletion fails, stops part-way, or frees more than the tree expected (a
+file grew since the scan), disko rescans only the parent directory, in the
+background. When it frees less than expected, or a hard link to a removed file
+survives outside what was deleted, the missing bytes could be anywhere, so
+disko rescans the whole tree. `x` is refused while that rescan runs; press `z`
+to stop it.
 
 `disko --read-only` removes the ability entirely.
 
@@ -351,6 +385,31 @@ $ disko /mnt --plain          # a blobfuse2 mount lives under here
 Pass `--remote` to walk them anyway. Naming a network mount as the scan root
 still scans it — asking for it is asking for it.
 
+The same goes for mounts that hold operating-system internals rather than your
+files — `proc`, `sysfs`, `devtmpfs`, `tmpfs`, `overlay`, `squashfs`, `autofs`
+and the rest of the pseudo-filesystem types (also `/proc`, `/sys`, `/dev`,
+`/run` and snap mounts by path, for anything not caught by type) on Linux;
+`/dev`, `/Volumes` and `/System/Volumes` on macOS. That includes `/tmp` where
+it is tmpfs. They show up in the tree as skipped, and naming one as the scan
+root still scans it.
+
+Whether a mount point is skipped is decided by what is mounted there *now*: an
+autofs placeholder that a real filesystem later gets mounted over (a systemd
+automount on `/boot` or `/efi`, say) is walked once something is actually
+there, not skipped because a pseudo mount briefly held that name.
+
+macOS splits one physical disk into a sealed, read-only system snapshot at `/`
+and the writable "Data" volume everything you save lives on, joined by
+firmlinks so they look like a single tree. disko folds that pair back into one
+row — `/`, writable, sized and inode-counted as the whole disk — everywhere it
+lists filesystems, because "Macintosh HD" is one disk to a person even though
+the kernel mounts it as two. `--filesystems --json` on macOS follows the same
+folding: it will not list `/System/Volumes/Data` as its own entry, and the
+folded `/` row reports the Data volume's `read_only` (`false`), not the sealed
+system volume's. Reports about one path — `disko --filesystems <path>`,
+`--inodes <path>`, `--details` — name the volume that path really lives on:
+`/System` is the read-only system volume, `~` is the Data volume.
+
 Note that `--depth` limits what is *kept*, not what is *walked*: sizes stay
 exact, so it does not make a slow mount fast.
 
@@ -358,7 +417,7 @@ exact, so it does not make a slow mount fast.
 
 | Flag | Does |
 | --- | --- |
-| `-t, --top <N>` | show the N largest entries, grouping the rest as "Other" |
+| `-t, --top <N>` | limit list and text output to N entries, grouping the rest as "Other" |
 | `--depth <N>` | keep only N levels of tree; sizes stay exact either way |
 | `--apparent` | count file lengths (`ls`) instead of blocks used (`du`) |
 | `--binary` | GiB/MiB instead of GB/MB |

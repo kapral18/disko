@@ -134,7 +134,7 @@ pub fn draw_progress(frame: &mut Frame, area: Rect, app: &App, deleting: &Deleti
         .fg(Color::Rgb(213, 94, 0))
         .add_modifier(Modifier::BOLD);
 
-    let spinner = SPINNER[(app.tick() / 2) % SPINNER.len()];
+    let spinner = theme::spinner(app.tick() / 2);
     let done = progress.items_done();
     let total = progress.items_total();
 
@@ -185,5 +185,3 @@ pub fn draw_progress(frame: &mut Frame, area: Rect, app: &App, deleting: &Deleti
         popup,
     );
 }
-
-const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];

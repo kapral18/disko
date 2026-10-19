@@ -7,88 +7,150 @@ mod explorer;
 mod footer;
 mod overview;
 mod picker;
+mod preferences;
 mod scanning;
 mod text;
 mod theme;
 
-use std::io::{Stdout, stdout};
-use std::time::Duration;
+use std::io::{self, Write, stdout};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use crossterm::cursor::Show;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode,
 };
+use crossterm::{execute, queue};
 use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::ListState;
 use ratatui::{Frame, Terminal};
 
 use app::{App, View};
+use preferences::BrowseView;
 
 /// How long a frame waits for input before redrawing anyway. Fast enough that
 /// the scan progress looks live, slow enough to stay idle when nothing moves.
 const FRAME: Duration = Duration::from_millis(120);
+
+/// A stream of ready keys must still yield to drawing and scan polling.
+const INPUT_BUDGET: Duration = Duration::from_millis(8);
+
+type TuiTerminal = Terminal<CrosstermBackend<FrameWriter>>;
+
+/// Collect cell commands before touching stdout. Discard them during unwinding
+/// so terminal cleanup cannot repaint after the hook restores the shell.
+#[derive(Default)]
+struct FrameWriter {
+    pending: Vec<u8>,
+}
+
+impl Write for FrameWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.pending.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // Ratatui's drop restores the cursor by flushing its backend.
+        if std::thread::panicking() {
+            self.pending.clear();
+            return Ok(());
+        }
+        let mut out = stdout().lock();
+        let result = out.write_all(&self.pending).and_then(|()| out.flush());
+        // A failed write may have sent a prefix; never replay it on cleanup.
+        self.pending.clear();
+        result
+    }
+}
 
 /// Widget state that belongs to the screen rather than the app.
 #[derive(Default)]
 struct Ui {
     list: ListState,
     picker: ListState,
+    chart: explorer::ChartCache,
 }
 
 pub fn run(mut app: App) -> Result<()> {
+    let preference_path = preferences::path();
+    let saved_view = preference_path
+        .as_deref()
+        .map(preferences::load)
+        .unwrap_or_default();
+    app.browsing_view = saved_view;
+    if matches!(app.view, View::Overview | View::Explorer) {
+        app.set_browsing_view(saved_view);
+    }
     let mut terminal = enter()?;
     let result = event_loop(&mut terminal, &mut app);
+    let browsing_view = app.browsing_view;
+    // The process is about to exit, which hands the memory back at once;
+    // freeing a whole-disk tree entry by entry would keep the shell waiting.
+    std::mem::forget(app);
     leave(&mut terminal)?;
+    if browsing_view != saved_view
+        && let Some(path) = preference_path
+        && let Err(error) = preferences::save(&path, browsing_view)
+    {
+        eprintln!("disko: could not save the view preference: {error}");
+    }
     result
 }
 
-fn enter() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+fn enter() -> Result<TuiTerminal> {
     // Without this a panic leaves the user in raw mode on the alternate
     // screen, with no echo and no prompt.
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen);
+        let _ = execute!(stdout(), EndSynchronizedUpdate, LeaveAlternateScreen, Show);
         previous(info);
     }));
 
     enable_raw_mode()?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen)?;
-    Ok(Terminal::new(CrosstermBackend::new(out))?)
+    Ok(Terminal::new(
+        CrosstermBackend::new(FrameWriter::default()),
+    )?)
 }
 
-fn leave(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+fn leave(terminal: &mut TuiTerminal) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        EndSynchronizedUpdate,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
 
-fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+fn event_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
     let mut ui = Ui::default();
     let mut tick = 0usize;
 
     loop {
         app.poll_scan();
         app.poll_delete();
+        app.poll_filesystems();
         app.tick_watch();
         app.advance();
-        terminal.draw(|frame| draw(frame, app, &mut ui, tick))?;
+        draw_frame(terminal, app, &mut ui, tick)?;
 
-        // A held-down arrow key repeats faster than a frame of a large
-        // directory takes to draw. Taking the whole queue rather than one key
-        // per frame keeps the cursor level with the keyboard, instead of
-        // building a backlog that carries on scrolling after the key is up.
+        // Batch ready keys, but yield while input is still arriving so a
+        // sustained burst cannot postpone every redraw until it stops.
         if event::poll(FRAME)? {
+            let started = Instant::now();
             loop {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, key),
                     _ => {}
                 }
-                if app.quit || !event::poll(Duration::ZERO)? {
+                if app.quit || started.elapsed() >= INPUT_BUDGET || !event::poll(Duration::ZERO)? {
                     break;
                 }
             }
@@ -96,9 +158,54 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
 
         tick = tick.wrapping_add(1);
         if app.quit {
+            // A scan that has counted everything may still be writing its
+            // snapshot; say why the screen waits rather than look hung. Marks
+            // or the search box would take the footer's place, and the
+            // process is leaving them.
+            if app.saving() {
+                app.marks.clear();
+                app.search_active = false;
+                app.status = Some("saving this scan… (q again to skip)".into());
+                let _ = draw_frame(terminal, app, &mut ui, tick);
+                while app.saving() && !quit_again() {}
+            }
             app.cancel_scan();
             return Ok(());
         }
+    }
+}
+
+fn draw_frame(terminal: &mut TuiTerminal, app: &mut App, ui: &mut Ui, tick: usize) -> Result<()> {
+    // Buffering reduces writes; synchronization keeps the terminal from showing
+    // part of a frame while it consumes those bytes.
+    queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let drawn = terminal
+        .draw(|frame| draw(frame, app, ui, tick))
+        .map(|_| ());
+    let ended = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    drawn?;
+    ended?;
+    Ok(())
+}
+
+/// Wait a moment for a key that says not to wait any longer: `q` or Ctrl-C.
+/// A terminal that cannot be read any more ends the wait too, rather than
+/// spin on it.
+fn quit_again() -> bool {
+    match event::poll(Duration::from_millis(5)) {
+        Ok(false) => return false,
+        Ok(true) => {}
+        Err(_) => return true,
+    }
+    match event::read() {
+        Ok(Event::Key(key)) => {
+            key.kind == KeyEventKind::Press
+                && (key.code == KeyCode::Char('q')
+                    || (key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)))
+        }
+        Ok(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -107,11 +214,11 @@ fn draw(frame: &mut Frame, app: &mut App, ui: &mut Ui, tick: usize) {
     match app.view {
         View::Picker => picker::draw(frame, area, app, &mut ui.picker),
         View::Scanning => scanning::draw(frame, area, app, tick),
-        View::Overview => overview::draw(frame, area, app, &mut ui.list),
-        View::Explorer => explorer::draw(frame, area, app),
+        View::Overview => overview::draw(frame, area, app, &mut ui.list, tick),
+        View::Explorer => explorer::draw(frame, area, app, &mut ui.chart, tick),
     }
     if app.details {
-        details::draw(frame, area, app);
+        details::draw(frame, area, app, tick);
     }
     // The confirmation sits above everything, including the details panel.
     if let Some(pending) = app.confirm.clone() {
@@ -247,8 +354,14 @@ fn handle_scanning(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Esc => {
-            app.cancel_scan();
-            app.status = Some("stopping — showing what was counted so far".into());
+            // Once the scan has counted everything there is no partial
+            // count to stop at; it is only being compared.
+            app.status = Some(if app.scan_counted() {
+                app::FINISHING.into()
+            } else {
+                app.cancel_scan();
+                "stopping — showing what was counted so far".into()
+            });
         }
         _ => {}
     }
@@ -264,7 +377,7 @@ fn handle_browsing(app: &mut App, key: KeyEvent) {
             } else if app.search.is_some() {
                 app.clear_search();
             } else if app.view == View::Explorer {
-                app.view = View::Overview;
+                app.set_browsing_view(BrowseView::List);
             } else if app.from_picker {
                 // Nothing left to close: step back out to the disk list.
                 app.return_to_picker();
@@ -281,15 +394,16 @@ fn handle_browsing(app: &mut App, key: KeyEvent) {
         // From the overview, Enter switches to the radial explorer; once
         // there, Enter drills into whatever is selected.
         KeyCode::Enter => match app.view {
-            View::Overview => app.view = View::Explorer,
+            View::Overview => app.set_browsing_view(BrowseView::Chart),
             _ => app.open_selected(),
         },
         KeyCode::Tab => {
-            app.view = if app.view == View::Overview {
-                View::Explorer
+            let view = if app.view == View::Overview {
+                BrowseView::Chart
             } else {
-                View::Overview
-            }
+                BrowseView::List
+            };
+            app.set_browsing_view(view);
         }
         KeyCode::Right | KeyCode::Char('l') => app.open_selected(),
         KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => app.go_up(),
@@ -304,6 +418,8 @@ fn handle_browsing(app: &mut App, key: KeyEvent) {
         KeyCode::Char(' ') => app.toggle_mark(),
         KeyCode::Char('x') | KeyCode::Delete => app.request_delete(),
         KeyCode::Char('r') => app.rescan(),
+        KeyCode::Char('R') => app.rescan_root(),
+        KeyCode::Char('z') => app.cancel_background_scan(),
         _ => {}
     }
 }

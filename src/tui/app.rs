@@ -1,17 +1,19 @@
 //! Interactive state: what is on screen, what is selected, and what a key does.
 
-use std::cell::{Ref, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use disko_core::scan::{self, Cancel, Finished, Progress};
-use disko_core::{Diff, DiskEntry, Filesystem, ScanOptions, SizeKind, Unit};
-use disko_render::{RadialNode, palette};
+use disko_core::{Diff, DiskEntry, Filesystem, ScanOptions, ScanState, SizeKind, Unit};
+use disko_render::{LayoutOptions, RadialNode, Segment, palette, radial};
 
+use super::preferences::BrowseView;
 use crate::deletion::{self, DeleteProgress, Outcome, Target};
 use crate::model::{self, Metric, Row, RowOptions, Sort};
 
@@ -25,7 +27,12 @@ fn deletion_status(
     outcomes: &[Outcome],
     unit: Unit,
 ) -> String {
-    let first_problem = outcomes.iter().find(|outcome| !outcome.succeeded());
+    // Name the outcome that left the tree in an unknown state when there is
+    // one; a refusal that touched nothing is less urgent than that.
+    let first_problem = outcomes
+        .iter()
+        .find(|outcome| !outcome.succeeded() && outcome.changed_tree())
+        .or_else(|| outcomes.iter().find(|outcome| !outcome.succeeded()));
     let problem_hint = first_problem.map(|outcome| {
         format!(
             "{}: {}",
@@ -33,8 +40,18 @@ fn deletion_status(
             outcome.detail()
         )
     });
+    let incomplete = first_problem.is_some_and(Outcome::changed_tree);
 
     match (deleted, skipped) {
+        (0, _) if incomplete => problem_hint
+            .map(|hint| match freed {
+                0 => format!("deletion incomplete — {hint}"),
+                _ => format!(
+                    "deletion incomplete · freed {} — {hint}",
+                    disko_core::size::format(freed, unit)
+                ),
+            })
+            .unwrap_or_else(|| "deletion incomplete — d for details".into()),
         (0, _) => problem_hint
             .map(|hint| format!("nothing deleted — {hint}"))
             .unwrap_or_else(|| "nothing deleted — d for details".into()),
@@ -70,6 +87,10 @@ const STREAM_KEEP: usize = 12;
 /// more than anything on screen can reach.
 const REFRESH_KEEP_DEPTH: usize = 5;
 
+/// How deep a focus scan keeps what it finds below the folder it was started
+/// for. Sizes stay exact; going further down starts the next focus scan.
+const FOCUS_KEEP_DEPTH: usize = REFRESH_KEEP_DEPTH;
+
 /// A pending deletion, waiting to be confirmed or called off.
 #[derive(Clone, Debug, Default)]
 pub struct Confirm {
@@ -90,16 +111,36 @@ impl Confirm {
     }
 }
 
+/// How completely the tree lists a folder; see [`App::cwd_listing`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Listing {
+    /// Every entry it holds is listed — no rows means it is empty.
+    Complete,
+    /// Its contents are past `--depth`; no rescan here would keep them.
+    BeyondDepth,
+    /// Counted but not all listed, or never finished; a scan can fill it.
+    Short,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum View {
     /// No path was given: choose a disk first.
     Picker,
     /// A scan is running.
     Scanning,
-    /// The ranked overview — the default answer to "what is using the space".
+    /// The ranked list of what is using the space.
     Overview,
     /// The radial explorer.
     Explorer,
+}
+
+impl From<BrowseView> for View {
+    fn from(view: BrowseView) -> Self {
+        match view {
+            BrowseView::Chart => Self::Explorer,
+            BrowseView::List => Self::Overview,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -118,8 +159,9 @@ pub struct Settings {
 #[derive(Clone, Debug)]
 pub struct Watch {
     pub every: u64,
-    /// The pruned tree the deltas are measured from.
-    baseline: Option<DiskEntry>,
+    /// The pruned tree the deltas are measured from. Shared, so a finished
+    /// scan's own thread can compare against it.
+    baseline: Option<Arc<DiskEntry>>,
     started_at: u64,
     last_scan: Instant,
     pub rounds: u64,
@@ -169,18 +211,57 @@ impl Deleting {
     }
 }
 
-/// The sunburst for one directory: the tree the layout runs over, and the
-/// table taking a path back to the wedge id standing for it.
+/// The sunburst for one directory, with geometry shared across selections.
 pub struct RadialCache {
-    key: RadialKey,
+    rings: usize,
     pub root: RadialNode,
     ids: HashMap<PathBuf, usize>,
+    visible: OnceLock<Segments>,
+    /// Includes slivers, built only when one needs to be highlighted.
+    all: OnceLock<Vec<Segment>>,
 }
 
 impl RadialCache {
     /// The wedge drawn for `path`, if it is one of the ones drawn at all.
     pub fn id_of(&self, path: &Path) -> Option<usize> {
         self.ids.get(path).copied()
+    }
+
+    /// The normal wedges plus the selected sliver, if it was too thin to draw.
+    /// Both builders assign ids in layout order, so inserting by id preserves
+    /// the sibling order used to highlight a run of tiny wedges.
+    pub fn segments(&self, pinned: Option<usize>) -> Segments {
+        let visible = self.visible.get_or_init(|| {
+            Arc::new(radial::layout(
+                &self.root,
+                &LayoutOptions {
+                    rings: self.rings,
+                    ..Default::default()
+                },
+            ))
+        });
+        let Some(id) = pinned else {
+            return Arc::clone(visible);
+        };
+        let Err(at) = visible.binary_search_by_key(&id, |segment| segment.id) else {
+            return Arc::clone(visible);
+        };
+        let all = self.all.get_or_init(|| {
+            radial::layout(
+                &self.root,
+                &LayoutOptions {
+                    rings: self.rings,
+                    min_span: 0.0,
+                    ..Default::default()
+                },
+            )
+        });
+        let Ok(selected) = all.binary_search_by_key(&id, |segment| segment.id) else {
+            return Arc::clone(visible);
+        };
+        let mut segments = visible.as_ref().clone();
+        segments.insert(at, all[selected].clone());
+        Arc::new(segments)
     }
 }
 
@@ -196,17 +277,323 @@ struct RadialKey {
     revision: u64,
 }
 
+/// Whether a running scan owns the whole tree or is grafted into a subtree.
+///
+/// Recorded when the session begins rather than worked out from
+/// `scanned_path == self.root` later: a `Refresh` can re-canonicalize
+/// `self.root` before the old session's result lands.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SessionKind {
+    /// A scan of the whole tree (`begin`, `R`, a full-refresh drift rescan).
+    Root,
+    /// A scan grafted into part of an existing tree (`scan_subtree`).
+    Subtree,
+}
+
 /// A scan running on another thread.
 struct Session {
+    scanned_path: PathBuf,
+    kind: SessionKind,
     progress: Arc<Progress>,
     cancel: Cancel,
-    handle: Option<JoinHandle<Result<DiskEntry>>>,
+    /// The thread the finished scan lands on.
+    handle: Option<Landing>,
     started: Instant,
+    /// Set when the user stopped this scan from a browsing view rather than
+    /// the scanning screen. There, a cancelled scan keeps its partial tree
+    /// on purpose; here the whole point is that the folder you were already
+    /// looking at is left as it was — the partial result is discarded once
+    /// the thread joins instead of grafted in. Folders a focus scan filled in
+    /// during it keep their fresh counts.
+    discard_on_finish: bool,
+}
+
+/// A scan of the folder on screen, run beside the session's scan whose tree
+/// does not list all of that folder yet (a refresh stub, a pruned snapshot,
+/// or a stopped scan).
+struct Focus {
+    path: PathBuf,
+    cancel: Cancel,
+    handle: JoinHandle<Result<DiskEntry>>,
+}
+
+/// The size type the screen shows, readable from a landing thread. A scan is
+/// compared in whatever size type is on screen when it finishes, as it was
+/// when the UI thread did the comparing — not the one it started under.
+#[derive(Clone, Default)]
+struct LiveSizeKind(Arc<AtomicBool>);
+
+impl LiveSizeKind {
+    fn set(&self, kind: SizeKind) {
+        self.0.store(kind == SizeKind::Apparent, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> SizeKind {
+        if self.0.load(Ordering::Relaxed) {
+            SizeKind::Apparent
+        } else {
+            SizeKind::Allocated
+        }
+    }
+}
+
+/// What a finished scan is compared against, settled when it starts so the
+/// comparison can run on a thread of its own.
+enum Compare {
+    /// A folder rescan grafted into the tree: nothing to compare.
+    Nothing,
+    /// Watch mode: against the first round, or become it.
+    Watch {
+        baseline: Option<Arc<DiskEntry>>,
+        started_at: u64,
+        kind: LiveSizeKind,
+    },
+    /// Against the newest stored snapshot, recording this scan as the next.
+    Snapshot { kind: LiveSizeKind, record: bool },
+}
+
+/// A finished scan with its comparison already worked out.
+struct Landed {
+    tree: DiskEntry,
+    diff: Option<Diff>,
+    /// Watch mode's first round, trimmed down to become the baseline.
+    baseline: Option<DiskEntry>,
+}
+
+/// What a landing thread and the UI tell each other.
+#[derive(Default)]
+struct LandingSignals {
+    /// Set by the UI when it lets go of the session — back to the disk list,
+    /// another disk picked: neither the comparison nor a snapshot of a scan
+    /// walked away from is wanted.
+    abandoned: AtomicBool,
+    /// Set by the landing once nothing is left to write to disk: the snapshot
+    /// recorded, or none to record. Quitting waits for this, not for the
+    /// comparison after it.
+    saved: AtomicBool,
+}
+
+/// A finished scan being compared on a thread of its own.
+struct Landing {
+    handle: JoinHandle<Result<Landed>>,
+    signals: Arc<LandingSignals>,
+}
+
+impl Landing {
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    /// Whether quitting now would lose a snapshot it has yet to write.
+    fn saving(&self) -> bool {
+        !self.signals.saved.load(Ordering::Relaxed) && !self.handle.is_finished()
+    }
+
+    /// Let go of it: nothing it would still compare or record is wanted, and
+    /// it is joined elsewhere.
+    fn abandon(self) {
+        self.signals.abandoned.store(true, Ordering::Relaxed);
+        join_in_background(self.handle);
+    }
+}
+
+/// Wait for `scan`, then compare its tree, on another thread. Diffing a whole
+/// disk against the last snapshot and writing it out as the next one takes
+/// seconds; on the UI thread that froze the screen at whatever moment the
+/// scan happened to finish.
+fn land_in_background(scan: JoinHandle<Result<DiskEntry>>, compare: Compare) -> Landing {
+    let signals = Arc::new(LandingSignals::default());
+    let shared = Arc::clone(&signals);
+    let handle = std::thread::spawn(move || {
+        let signals = shared;
+        let abandoned = || signals.abandoned.load(Ordering::Relaxed);
+        let tree = match scan.join() {
+            Ok(result) => result?,
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        // A partial count compared would show everything it had not reached
+        // yet as shrunk; an abandoned scan is not wanted at all.
+        let skip = tree.scan_state() == ScanState::Cancelled || abandoned();
+        if skip || !matches!(compare, Compare::Snapshot { record: true, .. }) {
+            // Nothing to write to disk, so nothing for a quit to wait for.
+            signals.saved.store(true, Ordering::Relaxed);
+        }
+        if skip {
+            return Ok(Landed {
+                tree,
+                diff: None,
+                baseline: None,
+            });
+        }
+        let (diff, baseline) = match compare {
+            Compare::Nothing => (None, None),
+            Compare::Watch {
+                baseline: Some(baseline),
+                started_at,
+                kind,
+            } => (
+                Some(disko_core::diff::diff(
+                    &baseline,
+                    &tree,
+                    kind.get(),
+                    started_at,
+                    disko_core::history::now(),
+                    disko_core::history::storage_floor(&baseline),
+                )),
+                None,
+            ),
+            Compare::Watch { baseline: None, .. } => {
+                (None, Some(disko_core::history::prune_for_storage(&tree)))
+            }
+            Compare::Snapshot { kind, record } => {
+                let previous = crate::commands::record_snapshot(&tree, record);
+                signals.saved.store(true, Ordering::Relaxed);
+                // The comparison is the slow half — reading the previous
+                // snapshot, then diffing — and not for a scan let go of
+                // meanwhile.
+                let diff = previous
+                    .filter(|_| !abandoned())
+                    .and_then(|(store, id)| store.load(&id).ok())
+                    .filter(|_| !abandoned())
+                    .map(|previous| crate::commands::diff_since(&previous, &tree, kind.get()));
+                (diff, None)
+            }
+        };
+        Ok(Landed {
+            tree,
+            diff,
+            baseline,
+        })
+    });
+    Landing { handle, signals }
+}
+
+/// Free `value` on a thread of its own. A whole-disk tree, or the comparison
+/// that mirrors one, is millions of entries, and freeing them one by one on
+/// the UI thread is a freeze of its own. If no thread can be started, `spawn`
+/// frees it right here instead.
+fn drop_in_background<T: Send + 'static>(value: T) {
+    let _ = std::thread::Builder::new().spawn(move || drop(value));
+}
+
+/// Wait for `handle` on a thread of its own. A finished thread's result is
+/// freed by whoever drops its handle last, and that must not be the UI
+/// thread; an unfinished one is left to stop there.
+fn join_in_background<T: Send + 'static>(handle: JoinHandle<T>) {
+    let _ = std::thread::Builder::new().spawn(move || drop(handle.join()));
+}
+
+/// Said when a stop comes after the scan has counted everything: there is no
+/// partial count to stop at any more, only the rest of the landing.
+pub const FINISHING: &str = "finishing — the count is done…";
+
+/// What a cached list for the folder on screen was built from. While none of
+/// it has moved, the list is still the right one.
+#[derive(Clone, PartialEq, Eq)]
+struct ListKey {
+    cwd: PathBuf,
+    revision: u64,
+    /// Growth lists come from the comparison, which only ever changes along
+    /// with the revision; this says which of the two lists is showing.
+    growth: bool,
+    options: RowOptions,
+}
+
+/// Folder, tree revision, size kind and count behind "Largest items".
+type LargestKey = (PathBuf, u64, SizeKind, usize);
+
+/// Laid-out sunburst wedges, shared with whatever frame is drawing them.
+type Segments = Arc<Vec<Segment>>;
+
+/// "Largest items": each path with its size.
+type Largest = Arc<Vec<(PathBuf, u64)>>;
+
+/// Folder, tree revision and size kind behind `cwd_shortfall`.
+type ShortfallKey = (PathBuf, u64, SizeKind);
+
+/// The values last built for the few folders visited most recently, so going
+/// back up to a folder just left finds its rows, "Largest items" and sunburst
+/// still there instead of building them again. A key naming the tree revision
+/// never matches again once the tree changes.
+struct Recent<K, V> {
+    slots: RefCell<Vec<(K, V)>>,
+    /// How many values are kept.
+    keep: usize,
+    /// Whether what falls out is big enough to free on a thread of its own;
+    /// a few numbers are cheaper to free than a thread is to start.
+    big: bool,
+}
+
+impl<K: PartialEq + Send + 'static, V: Clone + Send + 'static> Recent<K, V> {
+    /// The folder on screen and a few on the way back up from it.
+    const FOLDERS: usize = 4;
+
+    fn new() -> Self {
+        Self::with(Self::FOLDERS, false)
+    }
+
+    /// For values like a big folder's rows, freed off the UI thread when they
+    /// fall out.
+    fn big() -> Self {
+        Self::with(Self::FOLDERS, true)
+    }
+
+    /// A single slot, for lists that change with every key typed — a search
+    /// — so they never push a folder out of the cache beside it.
+    fn one(big: bool) -> Self {
+        Self::with(1, big)
+    }
+
+    fn with(keep: usize, big: bool) -> Self {
+        Self {
+            slots: RefCell::new(Vec::new()),
+            keep,
+            big,
+        }
+    }
+
+    /// Forget everything: nothing built from an older tree is asked for again.
+    fn clear(&self) {
+        let slots = std::mem::take(&mut *self.slots.borrow_mut());
+        if self.big && !slots.is_empty() {
+            drop_in_background(slots);
+        }
+    }
+
+    fn get_or_build(&self, key: K, build: impl FnOnce(&K) -> V) -> V {
+        let hit = {
+            let mut slots = self.slots.borrow_mut();
+            slots
+                .iter()
+                .position(|(cached, _)| *cached == key)
+                .map(|at| {
+                    let slot = slots.remove(at);
+                    let value = slot.1.clone();
+                    slots.push(slot);
+                    value
+                })
+        };
+        if let Some(value) = hit {
+            return value;
+        }
+        // Built with no borrow held, so building may read another cache.
+        let value = build(&key);
+        let mut slots = self.slots.borrow_mut();
+        if slots.len() >= self.keep {
+            let evicted = slots.remove(0);
+            if self.big {
+                drop_in_background(evicted);
+            }
+        }
+        slots.push((key, value.clone()));
+        value
+    }
 }
 
 pub struct App {
     pub settings: Settings,
     pub view: View,
+    pub(super) browsing_view: BrowseView,
     pub filesystems: Vec<Filesystem>,
     pub picker_index: usize,
     pub tree: Option<DiskEntry>,
@@ -225,6 +612,9 @@ pub struct App {
     pub metric: Metric,
     /// The comparison behind growth mode, when there is one.
     pub diff: Option<Diff>,
+    /// A deletion or subtree rescan changed the tree after the scan, which
+    /// drops the comparison until the next full scan.
+    changed_since_scan: bool,
     pub watch: Option<Watch>,
     /// True when the disk picker is where this scan came from, so "up" from
     /// the top of the tree has somewhere to go back to.
@@ -244,11 +634,40 @@ pub struct App {
     pub deleting: Option<Deleting>,
     tick: usize,
     session: Option<Session>,
+    /// The folder being scanned ahead of the running session, if any.
+    focus: Option<Focus>,
+    /// A folder `ensure_focus` gave up on, and the tree revision it gave up
+    /// at, so it is not retried every frame.
+    focus_refused: Option<(PathBuf, u64)>,
+    /// Mount points read by the first focus scan of a session and reused by
+    /// the rest, so each folder opened does not list the mounts again.
+    focus_boundaries: scan::MountBoundaries,
+    /// Folders a focus scan grafted into the tree during the running
+    /// session; their counts are fresh, not the snapshot's or the stub's.
+    focus_grafted: Vec<PathBuf>,
     mode: ScanMode,
     /// How many times the tree behind the view has been replaced or edited.
     revision: u64,
-    /// The last sunburst built, kept for as long as it stands.
-    radial: RefCell<Option<RadialCache>>,
+    /// Sunbursts for the folders visited last.
+    radial: Recent<RadialKey, Arc<RadialCache>>,
+    /// Rows for the folders visited last. Every frame draws them and most
+    /// keys look them up; sorting a big folder for each was a lag.
+    rows_cache: Recent<ListKey, Arc<Vec<Row>>>,
+    /// Rows of the folder on screen filtered by a search, on their own so
+    /// typing does not push folders out of `rows_cache`.
+    search_rows: Recent<ListKey, Arc<Vec<Row>>>,
+    /// The explorer legend's measure of those rows; see `legend_measure`.
+    measure_cache: Recent<(ListKey, Unit), (usize, i64)>,
+    /// The same for searched rows.
+    search_measure: Recent<(ListKey, Unit), (usize, i64)>,
+    /// The overview's "Largest items", kept the same way.
+    largest_cache: Recent<LargestKey, Largest>,
+    /// What each of those folders holds beyond its rows; see `cwd_shortfall`.
+    shortfall_cache: Recent<ShortfallKey, Option<(u64, u64)>>,
+    /// `settings.size_kind`, shared with the thread a scan lands on.
+    live_size_kind: LiveSizeKind,
+    /// The disk list being read again for the picker, off the UI thread.
+    filesystems_refresh: Option<JoinHandle<Vec<Filesystem>>>,
 }
 
 impl App {
@@ -257,6 +676,7 @@ impl App {
         Self {
             settings,
             view: View::Picker,
+            browsing_view: BrowseView::default(),
             filesystems,
             picker_index: 0,
             tree: None,
@@ -273,6 +693,7 @@ impl App {
             quit: false,
             metric: Metric::Size,
             diff: None,
+            changed_since_scan: false,
             watch: None,
             from_picker: false,
             confirm: None,
@@ -283,10 +704,28 @@ impl App {
             deleting: None,
             tick: 0,
             session: None,
+            focus: None,
+            focus_refused: None,
+            focus_boundaries: scan::MountBoundaries::default(),
+            focus_grafted: Vec::new(),
             mode: ScanMode::Fresh,
             revision: 0,
-            radial: RefCell::new(None),
+            radial: Recent::big(),
+            rows_cache: Recent::big(),
+            search_rows: Recent::one(true),
+            measure_cache: Recent::new(),
+            search_measure: Recent::one(false),
+            largest_cache: Recent::new(),
+            shortfall_cache: Recent::new(),
+            live_size_kind: LiveSizeKind::default(),
+            filesystems_refresh: None,
         }
+    }
+
+    pub(super) fn set_browsing_view(&mut self, view: BrowseView) {
+        self.browsing_view = view;
+        self.view = view.into();
+        self.selection = self.selection.min(self.rows().len().saturating_sub(1));
     }
 
     /// Rescan on a timer and report growth since the moment watching started.
@@ -311,26 +750,135 @@ impl App {
     /// Scan the same place again without disturbing the view — what watch mode
     /// does on every tick, and what `r` does on demand.
     pub fn refresh(&mut self) {
-        if self.root.as_os_str().is_empty() || self.session.is_some() {
+        if self.root.as_os_str().is_empty() || self.session.is_some() || self.deleting.is_some() {
             return;
         }
         let root = self.root.clone();
         self.begin(&root, ScanMode::Refresh);
     }
 
+    /// Correct an accounting drift a deletion left behind.
+    ///
+    /// A hard link that survived the batch ([`Outcome::links_survived`]) can
+    /// be anywhere in the tree, so only a full [`refresh`](Self::refresh) can
+    /// find it. `Deleted` targets that together freed less than the tree
+    /// believed they held get the same treatment, as a safeguard against
+    /// changes made outside disko since the scan. Any other drift only touched
+    /// what is under the target's parent, so rescanning the closest parent of
+    /// every drifted target is enough — on a `/` scan, one folder instead of
+    /// the whole disk.
+    fn rescan_drifted(&mut self, outcomes: &[Outcome], removed_allocated: &HashMap<PathBuf, u64>) {
+        if self.session.is_some() {
+            return;
+        }
+        // Summed over the batch: a hard link split across two targets frees
+        // nothing under the one the scan credited and everything under the
+        // other, so only the total says whether bytes went missing.
+        let (freed, expected) = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                Outcome::Deleted { path, freed, .. } => Some((
+                    *freed,
+                    removed_allocated.get(path).copied().unwrap_or(*freed),
+                )),
+                _ => None,
+            })
+            .fold((0u64, 0u64), |(freed, expected), (f, e)| {
+                (freed.saturating_add(f), expected.saturating_add(e))
+            });
+        let needs_full_rescan = outcomes.iter().any(Outcome::links_survived) || freed < expected;
+        if needs_full_rescan {
+            self.refresh();
+            return;
+        }
+        let Some(root) = self.parent_for_drifted(outcomes) else {
+            return;
+        };
+        if root == self.root {
+            self.refresh();
+        } else {
+            self.scan_subtree(root);
+        }
+    }
+
+    /// The lowest directory that contains every target `outcomes` says
+    /// drifted — usually one target's own parent; the common ancestor of
+    /// several, still short of a full rescan as long as they share one below
+    /// the scan root.
+    fn parent_for_drifted(&self, outcomes: &[Outcome]) -> Option<PathBuf> {
+        let mut ancestor: Option<PathBuf> = None;
+        for outcome in outcomes {
+            if !outcome.needs_rescan() {
+                continue;
+            }
+            let parent = outcome.path().parent().unwrap_or(&self.root);
+            ancestor = Some(match ancestor {
+                None => parent.to_path_buf(),
+                Some(current) => common_ancestor(&current, parent, &self.root),
+            });
+        }
+        ancestor
+    }
+
     fn begin(&mut self, path: &Path, mode: ScanMode) {
+        if self.deleting.is_some() {
+            self.status = Some("wait for deletion to finish before scanning".into());
+            return;
+        }
+        if self.confirm.is_some() {
+            return;
+        }
         let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if mode == ScanMode::Refresh && path != self.root {
+            // The root now resolves somewhere else than what is on screen —
+            // the same symlink-swap case `scan_subtree` refuses, just hit by
+            // rescanning the top of the tree instead of a folder under it.
+            // Grafting what `path` now points at back in under the old root
+            // would silently swap in a different subtree, so refuse before
+            // any stub replaces what is on screen.
+            self.status = Some(format!(
+                "{} now points somewhere else — go back and open it again",
+                model::display_path(&self.root)
+            ));
+            // Watch mode reaches here once per frame while the root stays
+            // moved; move its clock so the refusal repeats once an interval,
+            // not every frame.
+            if let Some(watch) = &mut self.watch {
+                watch.last_scan = Instant::now();
+            }
+            return;
+        }
         self.mode = mode;
         self.touch();
 
         if mode == ScanMode::Fresh {
+            // Watch mode normally never sees a `Fresh` begin at all — it
+            // scans one path for its whole run — except when a watched root
+            // disappears mid-scan: `poll_scan`'s error arm drops back to the
+            // Picker without clearing `watch`, and picking a filesystem from
+            // there reaches here with a different root. Leaving the old
+            // root's baseline in place would diff the new tree against a
+            // different place on disk; only the interval the user chose
+            // should survive a change of root, not what it was measured from.
+            if self.watch.is_some() && path != self.root {
+                if let Some(watch) = &mut self.watch {
+                    watch.baseline = None;
+                    watch.started_at = disko_core::history::now();
+                    watch.rounds = 0;
+                }
+                // The growth view was measured against the old root too.
+                self.set_diff(None);
+            }
             self.filesystem = disko_core::mounts::for_path(&path);
             self.root = path.clone();
             self.cwd = path.clone();
             self.selection = 0;
             self.search = None;
             self.search_active = false;
-            self.tree = None;
+            if let Some(previous) = self.tree.take() {
+                drop_in_background(previous);
+            }
+            self.changed_since_scan = false;
             self.status = None;
             self.streamed.clear();
             self.provisional = None;
@@ -344,34 +892,85 @@ impl App {
             {
                 self.tree = Some(snapshot.tree);
                 self.provisional = Some(snapshot.taken_at);
-                self.view = View::Overview;
+                self.view = self.browsing_view.into();
             }
-        } else if let Some(previous) = self.tree.take() {
+        } else if let Some(tree) = &mut self.tree {
             // A rescan builds a whole second tree before it can replace this
             // one, so holding on to it intact means every entry is in memory
             // twice for the length of the scan — a gigabyte, on a home
             // directory with two million things under it. Keep the part the
             // screen can actually reach and let go of the rest; `absorb_scan`
             // puts the full tree back in a moment.
-            self.tree = Some(visible_stub(
-                &self.root,
-                &previous,
+            let mut cut = Vec::new();
+            trim_to_visible(
+                &mut self.root.clone(),
+                tree,
                 &self.cwd,
                 REFRESH_KEEP_DEPTH,
-            ));
+                &mut cut,
+            );
+            drop_in_background(cut);
         }
 
+        // Only the initial progress screen consumes directory summaries.
+        // Background scans still publish their live counters without them.
+        let stream_depth = if self.view == View::Scanning {
+            STREAM_DEPTH
+        } else {
+            0
+        };
         let (progress, cancel, handle) = scan::scan_in_background_streaming(
-            path,
+            path.clone(),
             self.settings.scan_options.clone(),
-            STREAM_DEPTH,
+            stream_depth,
         );
+        // `rescan_root`/`refresh`'s own guard keeps this from firing on top
+        // of a live session, but `Fresh` reaches `begin` straight from the
+        // Picker (`pick_selected_filesystem`) with no such guard: a session
+        // could still be running against the place just left. Cancel its
+        // token before it is dropped, or the detached thread keeps scanning
+        // an abandoned root to a result nothing will ever read.
+        if let Some(previous) = self.session.take() {
+            previous.cancel.cancel();
+            if let Some(landing) = previous.handle {
+                landing.abandon();
+            }
+        }
+        // A focus scan belongs to the tree it was grafting into, now replaced.
+        self.drop_focus();
+        self.focus_boundaries = scan::MountBoundaries::default();
+        self.focus_grafted.clear();
+        let compare = self.compare_for(SessionKind::Root);
+        let landing = land_in_background(handle, compare);
         self.session = Some(Session {
+            scanned_path: path,
+            kind: SessionKind::Root,
             progress,
             cancel,
-            handle: Some(handle),
+            handle: Some(landing),
             started: Instant::now(),
+            discard_on_finish: false,
         });
+    }
+
+    /// What a scan of `kind` started now is compared against once it
+    /// finishes. Settled at the start so the scan's own thread can do the
+    /// comparing; see `land_in_background`.
+    fn compare_for(&self, kind: SessionKind) -> Compare {
+        // `settings` is public and can be set directly; start from it.
+        self.live_size_kind.set(self.settings.size_kind);
+        match (kind, &self.watch) {
+            (SessionKind::Subtree, _) => Compare::Nothing,
+            (SessionKind::Root, Some(watch)) => Compare::Watch {
+                baseline: watch.baseline.clone(),
+                started_at: watch.started_at,
+                kind: self.live_size_kind.clone(),
+            },
+            (SessionKind::Root, None) => Compare::Snapshot {
+                kind: self.live_size_kind.clone(),
+                record: self.settings.record_snapshots,
+            },
+        }
     }
 
     /// Advance the animation clock. Called once per frame.
@@ -381,11 +980,23 @@ impl App {
 
     /// Kick off a rescan when the watch interval is up.
     pub fn tick_watch(&mut self) {
+        // Anything other than a browsing view with a real tree and nothing
+        // else in flight means there is no tree behind the screen for a
+        // refresh to have anywhere sane to land — most visibly the Picker
+        // after a watched mount disappears (`Ok(Err(error))` in `poll_scan`
+        // switches the view there and drops the tree without touching
+        // `watch`), where `refresh` would otherwise be retried every frame.
+        let browsing = matches!(self.view, View::Overview | View::Explorer);
         let due = self
             .watch
             .as_ref()
             .is_some_and(|watch| watch.is_due() && self.tree.is_some());
-        if due && self.session.is_none() {
+        if due
+            && browsing
+            && self.session.is_none()
+            && self.deleting.is_none()
+            && self.confirm.is_none()
+        {
             self.refresh();
         }
     }
@@ -405,9 +1016,178 @@ impl App {
             .map(|session| session.progress.as_ref())
     }
 
+    pub fn scanned_path(&self) -> Option<&Path> {
+        self.session
+            .as_ref()
+            .map(|session| session.scanned_path.as_path())
+    }
+
+    /// True while a running scan will change what the current folder shows:
+    /// a rescan from a snapshot, or a session rooted at the folder or above it.
+    /// A stopped one is only winding down and fills nothing in.
+    pub fn cwd_is_being_scanned(&self) -> bool {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.cancel.is_cancelled())
+        {
+            return false;
+        }
+        self.provisional.is_some()
+            || self
+                .scanned_path()
+                .is_some_and(|scanned| self.cwd.starts_with(scanned))
+    }
+
+    /// Whether the folder on screen has no scan of its own ahead of the rest:
+    /// `ensure_focus` gave up on it (it now resolves elsewhere, crosses a
+    /// mount the run skips, or its own scan failed), so only the full scan
+    /// fills it in, when it gets there.
+    pub fn cwd_focus_refused(&self) -> bool {
+        self.focus_refused
+            .as_ref()
+            .is_some_and(|(path, revision)| *path == self.cwd && *revision == self.revision)
+    }
+
+    /// How completely the tree lists the current folder: every entry it
+    /// holds, everything but what `--depth` dropped, or less than it holds
+    /// for another reason — past what a focus scan keeps, pruned from a
+    /// snapshot or stub, or cut short by a stop.
+    pub fn cwd_listing(&self) -> Listing {
+        if self.cwd_shortfall().is_none() {
+            Listing::Complete
+        } else if self.subtree_scan_options(&self.cwd).max_depth == Some(0) {
+            // `r` would keep nothing below here either.
+            Listing::BeyondDepth
+        } else {
+            Listing::Short
+        }
+    }
+
+    /// What the current folder holds beyond the rows it lists, when its
+    /// listing is short and the size view is showing: `(entries, bytes)`.
+    /// Both are 0 for a listing a stop cut short without knowing the rest.
+    pub fn cwd_unlisted(&self) -> Option<(u64, u64)> {
+        if self.showing_growth() || self.cwd_listing() != Listing::Short {
+            return None;
+        }
+        self.cwd_shortfall()
+    }
+
+    /// What the current folder holds beyond the rows it lists, `(entries,
+    /// bytes)`, when it lists less than it holds. Kept like `rows`: it adds
+    /// up every child, and several things ask on every frame.
+    fn cwd_shortfall(&self) -> Option<(u64, u64)> {
+        let kind = self.settings.size_kind;
+        let key = (self.cwd.clone(), self.revision, kind);
+        self.shortfall_cache.get_or_build(key, |_| {
+            let entry = self
+                .current_entry()
+                .filter(|entry| lists_less_than_it_holds(entry))?;
+            let (items, bytes) =
+                entry
+                    .children
+                    .iter()
+                    .fold((1u64, 0u64), |(items, bytes), child| {
+                        (
+                            items.saturating_add(child.items),
+                            bytes.saturating_add(child.size(kind)),
+                        )
+                    });
+            Some((
+                entry.items.saturating_sub(items),
+                entry.size(kind).saturating_sub(bytes),
+            ))
+        })
+    }
+
+    /// When the screen shows a stored snapshot, the time it was taken — unless
+    /// the folder on screen has been counted afresh since, by a focus scan.
+    pub fn provisional_for_cwd(&self) -> Option<u64> {
+        self.provisional.filter(|_| {
+            !self
+                .focus_grafted
+                .iter()
+                .any(|path| self.cwd.starts_with(path))
+        })
+    }
+
+    /// Scan only a subtree in the background and graft the result into the current tree.
+    ///
+    /// An entry the scan marked `Skipped` is another filesystem or a system
+    /// mount; scanning it as its own root would exempt it from the filters
+    /// that skipped it and graft that volume into this tree's totals.
+    pub fn scan_subtree(&mut self, path: PathBuf) {
+        if self.session.is_some() || self.deleting.is_some() || self.confirm.is_some() {
+            return;
+        }
+        if self
+            .tree
+            .as_ref()
+            .and_then(|tree| tree.resolve(&path))
+            .is_some_and(|entry| entry.scan_state() == ScanState::Skipped)
+        {
+            self.status = Some(format!(
+                "{} was skipped by this scan — run disko on it directly",
+                model::display_path(&path)
+            ));
+            return;
+        }
+        // A canonical path that disagrees with what is on screen means the
+        // folder at `path` was replaced by a symlink since the last scan (or
+        // by something else `canonicalize` resolves through) — scanning what
+        // the symlink now points at and grafting it in under the old name
+        // would silently swap in a different subtree. A path `canonicalize`
+        // cannot resolve at all (already gone, a permission error on an
+        // ancestor) is not that case, so it still gets a rescan attempt and
+        // fails there with its own message instead of here.
+        let canonical = match path.canonicalize() {
+            Ok(canonical) if canonical != path => {
+                self.status = Some(format!(
+                    "{} now points somewhere else — go back and open it again",
+                    model::display_path(&path)
+                ));
+                return;
+            }
+            Ok(canonical) => canonical,
+            Err(_) => path.clone(),
+        };
+        let options = self.subtree_scan_options(&path);
+        let (progress, cancel, handle) = scan::scan_in_background(canonical, options);
+        self.focus_boundaries = scan::MountBoundaries::default();
+        self.focus_grafted.clear();
+        let landing = land_in_background(handle, self.compare_for(SessionKind::Subtree));
+        self.session = Some(Session {
+            scanned_path: path,
+            kind: SessionKind::Subtree,
+            progress,
+            cancel,
+            handle: Some(landing),
+            started: Instant::now(),
+            discard_on_finish: false,
+        });
+    }
+
+    fn subtree_scan_options(&self, path: &Path) -> ScanOptions {
+        let mut options = self.settings.scan_options.clone();
+        if let Some(max_depth) = options.max_depth {
+            let depth = path
+                .strip_prefix(&self.root)
+                .map(|relative| relative.components().count())
+                .unwrap_or(max_depth);
+            options.max_depth = Some(max_depth.saturating_sub(depth));
+        }
+        options
+    }
+
     /// Collect a finished scan. Called once per frame; cheap while running.
     pub fn poll_scan(&mut self) {
         self.collect_streamed();
+        // Before `poll_focus`: a focus that finished during the frame the
+        // user went past its reach must not graft.
+        self.drop_focus_left_too_far_above();
+        self.poll_focus();
+        self.ensure_focus();
 
         let Some(session) = &mut self.session else {
             return;
@@ -420,29 +1200,304 @@ impl App {
             return;
         }
 
-        let Some(handle) = session.handle.take() else {
+        let Some(landing) = session.handle.take() else {
             return;
         };
-        match handle.join() {
-            Ok(Ok(tree)) => {
-                self.absorb_scan(tree);
+        let scanned_path = session.scanned_path.clone();
+        let kind = session.kind;
+        let discard = session.discard_on_finish;
+        let joined = landing.handle.join();
+        if discard {
+            // A stopped folder rescan: drop its partial result and keep the
+            // folder on screen as it was — apart from folders opened during
+            // it, which a focus scan already filled in with fresh counts.
+            self.status = Some(if !self.focus_grafted.is_empty() {
+                format!(
+                    "stopped — {} unchanged, except folders opened meanwhile",
+                    model::display_path(&scanned_path)
+                )
+            } else {
+                format!("stopped — {} unchanged", model::display_path(&scanned_path))
+            });
+            self.session = None;
+            self.keep_focus_grafts_as_a_change();
+            self.drop_focus();
+            if let Ok(Ok(landed)) = joined {
+                drop_in_background(landed.tree);
+            }
+            return;
+        }
+        let mut applied = false;
+        match joined {
+            Ok(Ok(landed)) => {
+                if kind == SessionKind::Root {
+                    self.absorb_scan(landed);
+                } else {
+                    let grafted = match self.tree.as_mut() {
+                        Some(current_tree) => current_tree.graft(&scanned_path, landed.tree),
+                        None => Err(landed.tree),
+                    };
+                    match grafted {
+                        Ok(replaced) => {
+                            drop_in_background(replaced);
+                            self.finish_tree_mutation();
+                            let rows = self.rows().len();
+                            self.selection = self.selection.min(rows.saturating_sub(1));
+                            applied = true;
+                        }
+                        Err(refused) => {
+                            drop_in_background(refused);
+                            self.status = Some(format!(
+                                "cannot apply rescan for {}",
+                                model::display_path(&scanned_path)
+                            ));
+                        }
+                    }
+                }
             }
             Ok(Err(error)) => {
                 self.status = Some(format!("{error}"));
-                self.view = View::Picker;
+                if kind == SessionKind::Root {
+                    self.view = View::Picker;
+                }
+                // A failed root scan leaves nothing new to compare against, so
+                // treat it the way a finished one moves the clock — without
+                // this, `is_due()` stays true and `tick_watch` starts another
+                // one on the very next frame instead of waiting out the
+                // interval. A failed folder rescan is not a watch round.
+                if kind == SessionKind::Root
+                    && let Some(watch) = &mut self.watch
+                {
+                    watch.last_scan = Instant::now();
+                }
             }
             // A panicked worker must not take the UI down with it.
             Err(_) => {
                 self.status = Some("scan thread panicked".to_string());
-                self.view = View::Picker;
+                if kind == SessionKind::Root {
+                    self.view = View::Picker;
+                }
+                if kind == SessionKind::Root
+                    && let Some(watch) = &mut self.watch
+                {
+                    watch.last_scan = Instant::now();
+                }
             }
         }
         self.session = None;
+        if kind == SessionKind::Subtree && !applied {
+            // A folder rescan that failed, panicked or could not be applied
+            // left the tree as it was, except folders a focus scan filled in.
+            self.keep_focus_grafts_as_a_change();
+        }
+        // The tree on screen is now the scan's own; a focus result would only
+        // graft older, partial numbers back over it.
+        self.drop_focus();
+    }
+
+    /// Folders a focus scan filled in during a folder rescan that did not
+    /// land keep their new counts, so the tree is no longer the last scan's:
+    /// say so the way a landed rescan does, or growth would compare it.
+    fn keep_focus_grafts_as_a_change(&mut self) {
+        if !self.focus_grafted.is_empty() {
+            self.finish_tree_mutation();
+        }
+    }
+
+    /// A focus left behind more levels up than it keeps would graft back a
+    /// listing that stops above the folder on screen, emptying it.
+    fn drop_focus_left_too_far_above(&mut self) {
+        if self.focus.as_ref().is_some_and(|focus| {
+            self.cwd
+                .strip_prefix(&focus.path)
+                .is_ok_and(|below| below.components().count() >= FOCUS_KEEP_DEPTH)
+        }) {
+            self.drop_focus();
+        }
+    }
+
+    /// Keep browsing ahead of a running scan. When the folder on screen lists
+    /// less than it holds — below what a refresh stub keeps, pruned out of
+    /// the snapshot being shown, or never reached by a scan that was stopped
+    /// — and the root scan or an `r` rescan above it will fill it in later,
+    /// scan just that folder on the priority pool and graft it in when it
+    /// lands, instead of waiting for the whole scan.
+    ///
+    /// Only one runs at a time. Opening another such folder — a sibling or a
+    /// child — stops the previous one: the priority pool, like any rayon
+    /// pool, finishes work it already started before it takes a new job, so
+    /// a parent's scan left running would make the child wait for all of it.
+    fn ensure_focus(&mut self) {
+        // Only a scan that is still counting will be slow to arrive — the
+        // root scan, or an `r` rescan of a folder above this one — and only
+        // the size view lists from `self.tree`; growth lists the diff. One
+        // that has counted everything is only being compared and lands soon.
+        let Some(scanned) = self.session.as_ref().and_then(|session| {
+            let running = !session.cancel.is_cancelled()
+                && !session.progress.is_finished()
+                && session
+                    .handle
+                    .as_ref()
+                    .is_some_and(|handle| !handle.is_finished());
+            running.then(|| session.scanned_path.clone())
+        }) else {
+            return;
+        };
+        if self.showing_growth()
+            // The session itself is already walking that folder.
+            || self.cwd == scanned
+            || !self.cwd.starts_with(&scanned)
+            || self.focus.as_ref().is_some_and(|f| f.path == self.cwd)
+            || self
+                .focus_refused
+                .as_ref()
+                .is_some_and(|(path, revision)| *path == self.cwd && *revision == self.revision)
+            || self.cwd_shortfall().is_none()
+        {
+            return;
+        }
+        let mut options = self.subtree_scan_options(&self.cwd);
+        if options.max_depth == Some(0) {
+            // At the `--depth` limit: the session's scan keeps nothing here either.
+            return;
+        }
+        options.max_depth = Some(
+            options
+                .max_depth
+                .map_or(FOCUS_KEEP_DEPTH, |depth| depth.min(FOCUS_KEEP_DEPTH)),
+        );
+        self.drop_focus();
+        let (_, cancel, handle) = scan::scan_in_background_prioritized(
+            self.cwd.clone(),
+            scanned,
+            options,
+            self.focus_boundaries.clone(),
+        );
+        self.focus = Some(Focus {
+            path: self.cwd.clone(),
+            cancel,
+            handle,
+        });
+    }
+
+    /// Graft a finished focus scan into the tree on screen.
+    fn poll_focus(&mut self) {
+        if !self.focus.as_ref().is_some_and(|f| f.handle.is_finished()) {
+            return;
+        }
+        let Some(focus) = self.focus.take() else {
+            return;
+        };
+        // The graft can re-rank the folder the cursor is on; keep the cursor
+        // on the same entry rather than the same index.
+        let selected = self.selected_row().and_then(|row| row.path);
+        // The scan resolves its root on its own thread, so the UI never
+        // waits on a path lookup. As in `scan_subtree`, a folder that now
+        // resolves elsewhere (swapped for a symlink) must not be grafted in
+        // under its old name.
+        let landed = match focus.handle.join() {
+            Ok(Ok(subtree)) => Some(subtree),
+            _ => None,
+        };
+        let grafted = landed.and_then(|subtree| {
+            let result = match self.tree.as_mut() {
+                Some(tree) if subtree.root_path() == focus.path => tree.graft(&focus.path, subtree),
+                _ => Err(subtree),
+            };
+            match result {
+                Ok(replaced) => Some(replaced),
+                // Five levels of a big folder, possibly.
+                Err(refused) => {
+                    drop_in_background(refused);
+                    None
+                }
+            }
+        });
+        if let Some(replaced) = grafted {
+            drop_in_background(replaced);
+            self.touch();
+            self.focus_grafted.push(focus.path.clone());
+            if self.step_out_of_a_vanished_folder() {
+                return;
+            }
+            let rows = self.rows();
+            let still_here = |path: &PathBuf| {
+                self.tree
+                    .as_ref()
+                    .is_some_and(|tree| tree.resolve(path).is_some())
+            };
+            self.selection = selected
+                .and_then(|path| {
+                    rows.iter()
+                        .position(|row| row.path.as_ref() == Some(&path))
+                        // An entry folded into "Other" is still under the
+                        // cursor there; one that is gone is not.
+                        .or_else(|| {
+                            still_here(&path)
+                                .then(|| rows.iter().position(|row| row.path.is_none()))
+                                .flatten()
+                        })
+                })
+                .unwrap_or(self.selection.min(rows.len().saturating_sub(1)));
+            return;
+        }
+        // Failed, moved, or no longer fits the tree: leave it to the session.
+        self.focus_refused = Some((focus.path, self.revision));
+    }
+
+    fn drop_focus(&mut self) {
+        if let Some(focus) = self.focus.take() {
+            focus.cancel.cancel();
+            join_in_background(focus.handle);
+        }
+        self.focus_refused = None;
+    }
+
+    /// Move up from a folder the tree no longer has — or now has as a file,
+    /// replaced since the snapshot — to its nearest ancestor that it does.
+    fn climb_to_a_listed_folder(&mut self) {
+        while !self.current_entry().is_some_and(DiskEntry::is_dir) && self.cwd != self.root {
+            match self.cwd.parent() {
+                Some(parent) => self.cwd = parent.to_path_buf(),
+                None => {
+                    self.cwd = self.root.clone();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// After the tree on screen is replaced or grafted: if the folder being
+    /// shown is no longer in it (deleted since the snapshot, or past what a
+    /// stopped scan reached), go up to the nearest folder that is, as `h`
+    /// would. Returns whether it moved.
+    ///
+    /// Not in the growth view, which lists from the diff and keeps removed
+    /// folders on purpose. A search being typed stays open — the keys after
+    /// it are still meant for the search box — but a finished one is for
+    /// the folder left behind and is dropped.
+    fn step_out_of_a_vanished_folder(&mut self) -> bool {
+        if self.showing_growth() {
+            return false;
+        }
+        let folder = self.cwd.clone();
+        self.climb_to_a_listed_folder();
+        if self.cwd == folder {
+            return false;
+        }
+        self.selection = 0;
+        if !self.search_active {
+            self.search = None;
+        }
+        true
     }
 
     /// Absorb whatever the running scan has finished counting since the last
     /// frame, keeping the largest first.
     fn collect_streamed(&mut self) {
+        if self.view != View::Scanning {
+            return;
+        }
         let Some(session) = &self.session else { return };
         let fresh = session.progress.drain_completed();
         if fresh.is_empty() {
@@ -464,49 +1519,64 @@ impl App {
         self.streamed = kept;
     }
 
-    /// Take a finished scan: work out what changed, then remember it.
+    /// Take a finished scan: the comparison `land_in_background` worked out,
+    /// then the tree itself.
     ///
-    /// The comparison has to happen before the snapshot is recorded, or this
-    /// scan would be diffed against itself and every week would look quiet.
-    fn absorb_scan(&mut self, tree: DiskEntry) {
-        let kind = self.settings.size_kind;
+    /// A cancelled scan is a partial count: it lands without a diff and does
+    /// not count as a watch round.
+    fn absorb_scan(&mut self, landed: Landed) {
+        let Landed {
+            tree,
+            diff,
+            baseline,
+        } = landed;
+        let cancelled = tree.scan_state() == ScanState::Cancelled;
 
-        match &mut self.watch {
+        // `None` keeps the comparison already showing.
+        let replacement = match &mut self.watch {
+            Some(watch) if cancelled => {
+                watch.last_scan = Instant::now();
+                Some(None)
+            }
             Some(watch) => {
                 watch.last_scan = Instant::now();
                 watch.rounds += 1;
-                match &watch.baseline {
+                match baseline {
+                    // The first pass is the baseline; there is nothing to
+                    // compare it against yet.
                     Some(baseline) => {
-                        self.diff = Some(disko_core::diff::diff(
-                            baseline,
-                            &tree,
-                            kind,
-                            watch.started_at,
-                            disko_core::history::now(),
-                            disko_core::history::storage_floor(baseline),
-                        ));
+                        watch.baseline = Some(Arc::new(baseline));
+                        None
                     }
-                    None => {
-                        // The first pass is the baseline; there is nothing to
-                        // compare it against yet.
-                        watch.baseline = Some(disko_core::history::prune_for_storage(&tree));
-                    }
+                    None => Some(diff),
                 }
             }
-            None => {
-                self.diff =
-                    crate::commands::record_and_diff(&tree, kind, self.settings.record_snapshots);
-            }
+            None => Some(diff),
+        };
+        if let Some(diff) = replacement {
+            self.set_diff(diff);
         }
 
-        self.tree = Some(tree);
+        // The tree being replaced can be a whole disk.
+        if let Some(previous) = self.tree.replace(tree) {
+            drop_in_background(previous);
+        }
+        self.changed_since_scan = false;
+        // A stop that came too late to cut the count short said so; the full
+        // count is here now.
+        if self.status.as_deref() == Some(FINISHING) {
+            self.status = None;
+        }
         self.touch();
         // Whatever is on screen is now the real thing.
         self.provisional = None;
         self.streamed.clear();
         if self.mode == ScanMode::Fresh {
-            self.view = View::Overview;
+            self.view = self.browsing_view.into();
         }
+        // A stopped scan may not have reached the folder on screen, which a
+        // focus scan had filled in ahead of it.
+        self.step_out_of_a_vanished_folder();
         // A snapshot's tree is pruned, so the cursor may have been sitting on
         // a row that the full scan renders differently.
         let rows = self.rows().len();
@@ -527,9 +1597,24 @@ impl App {
     /// Switch between "what is big" and "what changed".
     pub fn toggle_metric(&mut self) {
         if self.diff.is_none() {
-            self.status = Some(match self.watch.is_some() {
-                true => "waiting for the first rescan".into(),
-                false => "no earlier scan to compare against — this one is now the baseline".into(),
+            let stopped = self
+                .tree
+                .as_ref()
+                .is_some_and(|tree| tree.scan_state() == ScanState::Cancelled);
+            self.status = Some(if stopped {
+                "scan was stopped — no growth comparison for a partial count".into()
+            } else if let Some(watch) = &self.watch {
+                if watch.baseline.is_none() {
+                    "waiting for the first rescan".into()
+                } else {
+                    "waiting for the next rescan".into()
+                }
+            } else if self.changed_since_scan {
+                "totals changed since the scan — R rescans and compares again".into()
+            } else if self.settings.record_snapshots {
+                "no earlier scan to compare against — this one is now the baseline".into()
+            } else {
+                "no earlier scan to compare against".into()
             });
             return;
         }
@@ -556,6 +1641,70 @@ impl App {
         }
     }
 
+    /// Stop a background scan (`r`, `R`, or the automatic rescan after a
+    /// drifted deletion) from the browsing views. Also re-enables deletion,
+    /// which a running scan otherwise refuses.
+    ///
+    /// A subtree scan (`r`, or a drift rescan scoped to one directory) still
+    /// has the pre-scan folder to fall back on, so the folder already on
+    /// screen is what the user is looking at, and stays as it was — apart
+    /// from folders a focus scan filled in meanwhile, which keep fresh counts.
+    ///
+    /// A session rooted at the scan root (`R`, `r` at the root, or a drift
+    /// rescan that resolves to a full [`refresh`](Self::refresh)) already
+    /// trimmed the tree on screen in place with [`trim_to_visible`] the moment it began
+    /// — there is no earlier tree here to hold on to. Cancelling one of those
+    /// instead has to behave like `Esc` on the scanning screen: let the
+    /// partial result land through the normal `poll_scan` -> `absorb_scan`
+    /// path, so whatever the scan counted before it stopped replaces the
+    /// stub instead of the stub itself landing, the stub never becomes what a
+    /// snapshot records or what a mark or deletion sees, and watch mode's
+    /// clock moves the same way a finished scan moves it instead of firing
+    /// again the moment this frame ends.
+    pub fn cancel_background_scan(&mut self) {
+        if self.provisional.is_some() {
+            self.status = Some("still painting last-known numbers — wait for the scan".into());
+            return;
+        }
+        if self.scan_counted()
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.kind == SessionKind::Root)
+        {
+            self.status = Some(FINISHING.into());
+            return;
+        }
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        if session.kind == SessionKind::Root {
+            session.cancel.cancel();
+            self.status = Some("stopping — showing what was counted so far".into());
+            return;
+        }
+        session.cancel.cancel();
+        session.discard_on_finish = true;
+        self.status = Some("stopping the background scan…".into());
+    }
+
+    /// Whether the running scan has counted everything and is only being
+    /// compared (see `land_in_background`): too late to stop it short.
+    pub fn scan_counted(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| !session.cancel.is_cancelled() && session.progress.is_finished())
+    }
+
+    /// Whether quitting now would lose a snapshot the landing has yet to
+    /// write. Not tied to whether the scan was stopped: one stopped in the
+    /// instant after it finished counting still lands whole and records.
+    pub fn saving(&self) -> bool {
+        self.session.as_ref().is_some_and(|session| {
+            session.progress.is_finished() && session.handle.as_ref().is_some_and(Landing::saving)
+        })
+    }
+
     pub fn current_entry(&self) -> Option<&DiskEntry> {
         self.tree.as_ref()?.resolve(&self.cwd)
     }
@@ -565,30 +1714,84 @@ impl App {
             size_kind: self.settings.size_kind,
             top: cap.then_some(self.settings.top),
             sort: self.sort,
-            filter: self.search.clone(),
+            // An empty query lists what no query does; keyed the same, the
+            // search box opening does not build the list again.
+            filter: self.search.clone().filter(|query| !query.is_empty()),
         }
     }
 
-    /// Rows for the current directory. Owned, so callers can hold them while
-    /// mutating the app.
-    pub fn rows(&self) -> Vec<Row> {
+    /// What a list for the folder on screen is built from.
+    fn list_key(&self) -> ListKey {
         // The explorer draws every wedge, so it must not fold the tail into
         // an "Other" row that has no path to open.
         let cap = self.view != View::Explorer;
-        if self.showing_growth() {
-            return match self.current_change() {
-                Some(node) => model::growth_rows(node, &self.row_options(cap)),
-                None => Vec::new(),
-            };
-        }
-        match self.current_entry() {
-            Some(entry) => model::rows(&self.cwd, entry, &self.row_options(cap)),
-            None => Vec::new(),
+        ListKey {
+            cwd: self.cwd.clone(),
+            revision: self.revision,
+            growth: self.showing_growth(),
+            options: self.row_options(cap),
         }
     }
 
+    /// Rows for the current directory, built once per folder, tree revision,
+    /// view and row options: every frame draws them and most keys look them
+    /// up. Shared, so callers can hold them while mutating the app.
+    pub fn rows(&self) -> Arc<Vec<Row>> {
+        let key = self.list_key();
+        let cache = if key.options.filter.is_some() {
+            &self.search_rows
+        } else {
+            &self.rows_cache
+        };
+        cache.get_or_build(key, |key| {
+            Arc::new(if key.growth {
+                self.current_change()
+                    .map(|node| model::growth_rows(node, &key.options))
+                    .unwrap_or_default()
+            } else {
+                self.current_entry()
+                    .map(|entry| model::rows(&self.cwd, entry, &key.options))
+                    .unwrap_or_default()
+            })
+        })
+    }
+
+    /// What the explorer's legend measures over every row — the widest amount
+    /// it lines up and the biggest change it colours by — kept like the rows
+    /// themselves.
+    pub fn legend_measure(&self) -> (usize, i64) {
+        let key = (self.list_key(), self.settings.unit);
+        let cache = if key.0.options.filter.is_some() {
+            &self.search_measure
+        } else {
+            &self.measure_cache
+        };
+        cache.get_or_build(key, |(list, unit)| {
+            crate::tui::explorer::measure(&self.rows(), list.growth, *unit)
+        })
+    }
+
     pub fn selected_row(&self) -> Option<Row> {
-        self.rows().into_iter().nth(self.selection)
+        self.rows().get(self.selection).cloned()
+    }
+
+    /// The overview's "Largest items" for the folder on screen, with their
+    /// sizes, kept like `rows`: finding them walks two levels of the tree.
+    pub fn largest_items(&self, count: usize) -> Largest {
+        let kind = self.settings.size_kind;
+        let key = (self.cwd.clone(), self.revision, kind, count);
+        self.largest_cache.get_or_build(key, |_| {
+            Arc::new(
+                self.current_entry()
+                    .map(|entry| {
+                        model::largest_items(&self.cwd, entry, count, kind)
+                            .into_iter()
+                            .map(|(path, item)| (path, item.size(kind)))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        })
     }
 
     pub fn move_selection(&mut self, delta: isize) {
@@ -622,7 +1825,7 @@ impl App {
             self.status = Some(format!("{} is a file", model::display_path(&path)));
             return;
         }
-        self.cwd = path;
+        self.cwd = path.clone();
         self.selection = 0;
         self.search = None;
         self.search_active = false;
@@ -667,6 +1870,10 @@ impl App {
             self.status = Some("disko is running read-only".into());
             return;
         }
+        if self.session.is_some() {
+            self.status = Some("wait for the scan to finish before deleting".into());
+            return;
+        }
         let Some(tree) = &self.tree else { return };
 
         let paths: Vec<PathBuf> = if self.marks.is_empty() {
@@ -677,7 +1884,13 @@ impl App {
         } else {
             let mut marked: Vec<PathBuf> = self.marks.iter().cloned().collect();
             marked.sort();
-            marked
+            let mut pruned: Vec<PathBuf> = Vec::new();
+            for path in marked {
+                if !pruned.iter().any(|parent| path.starts_with(parent)) {
+                    pruned.push(path);
+                }
+            }
+            pruned
         };
 
         let targets: Vec<Target> = paths
@@ -686,6 +1899,8 @@ impl App {
                 let entry = tree.resolve(&path)?;
                 Some(Target {
                     size: entry.size(self.settings.size_kind),
+                    allocated_size: entry.allocated_size,
+                    filesystem_identity: entry.filesystem_identity(),
                     is_dir: entry.is_dir(),
                     path,
                 })
@@ -728,6 +1943,10 @@ impl App {
     /// files takes long enough that doing it here would freeze the screen with
     /// no way to tell whether anything was happening.
     pub fn commit_delete(&mut self) {
+        if self.session.is_some() {
+            self.status = Some("wait for the scan to finish before deleting".into());
+            return;
+        }
         let Some(confirm) = &mut self.confirm else {
             return;
         };
@@ -740,7 +1959,9 @@ impl App {
         self.confirm = None;
         self.outcomes.clear();
 
-        let (progress, cancel, handle) = deletion::delete_in_background(targets, self.root.clone());
+        let root_identity = self.tree.as_ref().and_then(DiskEntry::filesystem_identity);
+        let (progress, cancel, handle) =
+            deletion::delete_in_background(targets, self.root.clone(), root_identity);
         self.deleting = Some(Deleting {
             progress,
             cancel,
@@ -779,14 +2000,34 @@ impl App {
     }
 
     fn apply_outcomes(&mut self, outcomes: Vec<Outcome>) {
+        let needs_rescan = outcomes.iter().any(Outcome::needs_rescan);
+        // What the tree still believed each deleted target held, captured on
+        // the way out — `rescan_drifted` needs it to tell a hard link that
+        // survived somewhere else in the tree (freed short of that number,
+        // could be anywhere) from a target whose own accounting just needed
+        // its parent rescanned.
+        let mut removed_allocated: HashMap<PathBuf, u64> = HashMap::new();
         // Correct the totals in place rather than paying for a rescan.
+        let mut removed_trees = Vec::new();
         if let Some(tree) = &mut self.tree {
             for outcome in &outcomes {
-                if let Outcome::Deleted { path, .. } = outcome {
-                    tree.remove(path);
+                if let Outcome::Deleted { path, .. } = outcome
+                    && let Some(removed) = tree.remove(path)
+                {
+                    removed_allocated.insert(path.clone(), removed.allocated_size);
+                    removed_trees.push(removed);
                 }
             }
-            self.touch();
+            self.climb_to_a_listed_folder();
+        }
+        // What was deleted can be a big folder; one thread frees all of it.
+        if !removed_trees.is_empty() {
+            drop_in_background(removed_trees);
+        }
+
+        // Invalidate diff since tree has mutated, avoiding stale entries in growth view.
+        if outcomes.iter().any(Outcome::changed_tree) {
+            self.finish_tree_mutation();
         }
 
         let freed = deletion::freed(&outcomes);
@@ -796,11 +2037,18 @@ impl App {
             .count();
         let refused = outcomes.len() - deleted;
 
-        for outcome in &outcomes {
-            if let Outcome::Deleted { path, .. } = outcome {
-                self.marks.remove(path);
-            }
-        }
+        let deleted_paths: Vec<&Path> = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                Outcome::Deleted { path, .. } => Some(path.as_path()),
+                _ => None,
+            })
+            .collect();
+        self.marks.retain(|mark| {
+            !deleted_paths
+                .iter()
+                .any(|deleted| mark.starts_with(deleted))
+        });
 
         self.status = Some(deletion_status(
             deleted,
@@ -818,15 +2066,46 @@ impl App {
         // The row under the cursor may have just been removed.
         let rows = self.rows().len();
         self.selection = self.selection.min(rows.saturating_sub(1));
+
+        if needs_rescan {
+            self.rescan_drifted(&self.outcomes.clone(), &removed_allocated);
+        }
+    }
+
+    /// Swap in a new comparison. The old one mirrors the whole scanned tree,
+    /// so it is freed off the UI thread.
+    fn set_diff(&mut self, diff: Option<Diff>) {
+        if let Some(old) = std::mem::replace(&mut self.diff, diff) {
+            drop_in_background(old);
+        }
+    }
+
+    /// Not recorded as a snapshot: the tree is no longer a scan, and a
+    /// graft can count a hard link twice (see `DiskEntry::graft`).
+    fn finish_tree_mutation(&mut self) {
+        // Only promise a comparison that a full rescan can bring back.
+        self.changed_since_scan |= self.diff.is_some() || self.settings.record_snapshots;
+        self.set_diff(None);
+        // Watch mode owns the growth metric and its baseline; the next tick
+        // restores the diff.
+        if self.watch.is_none() && self.metric == Metric::Growth {
+            self.metric = Metric::Size;
+        }
+        self.touch();
     }
 
     /// Drop everything belonging to the current scan and show the disks again.
     pub fn return_to_picker(&mut self) {
         self.cancel_scan();
-        self.session = None;
+        if let Some(landing) = self.session.take().and_then(|session| session.handle) {
+            landing.abandon();
+        }
+        self.drop_focus();
         self.view = View::Picker;
-        self.tree = None;
-        self.diff = None;
+        if let Some(tree) = self.tree.take() {
+            drop_in_background(tree);
+        }
+        self.set_diff(None);
         self.touch();
         self.metric = Metric::Size;
         self.root = PathBuf::new();
@@ -837,8 +2116,39 @@ impl App {
         // Marks are paths inside the scan that is being left behind.
         self.marks.clear();
         self.status = None;
-        // Capacities move while you are busy looking at one disk.
-        self.filesystems = disko_core::mounts::list(self.settings.show_all_filesystems);
+        // Capacities move while you are busy looking at one disk. Reading
+        // them waits on every mounted volume, so it happens off the UI
+        // thread; the list already on screen stands in until it lands.
+        let all = self.settings.show_all_filesystems;
+        self.filesystems_refresh = Some(std::thread::spawn(move || disko_core::mounts::list(all)));
+    }
+
+    /// Take the disk list `return_to_picker` started reading, once it is in.
+    pub fn poll_filesystems(&mut self) {
+        if !self
+            .filesystems_refresh
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            return;
+        }
+        if let Some(Ok(filesystems)) = self.filesystems_refresh.take().map(JoinHandle::join) {
+            // Keep the cursor on the same disk when one was added or removed
+            // above it while the list was being read.
+            let selected = self
+                .filesystems
+                .get(self.picker_index)
+                .map(|fs| fs.mount_point.clone());
+            self.filesystems = filesystems;
+            self.picker_index = selected
+                .and_then(|mount| {
+                    self.filesystems
+                        .iter()
+                        .position(|fs| fs.mount_point == mount)
+                })
+                .unwrap_or(self.picker_index)
+                .min(self.filesystems.len().saturating_sub(1));
+        }
     }
 
     /// Show the selected entry in the desktop's file manager.
@@ -910,6 +2220,7 @@ impl App {
             SizeKind::Allocated => SizeKind::Apparent,
             SizeKind::Apparent => SizeKind::Allocated,
         };
+        self.live_size_kind.set(self.settings.size_kind);
         self.status = Some(match self.settings.size_kind {
             SizeKind::Allocated => "showing space used on disk".into(),
             SizeKind::Apparent => "showing apparent file sizes".into(),
@@ -942,14 +2253,39 @@ impl App {
     }
 
     pub fn rescan(&mut self) {
-        let root = self.root.clone();
-        if !root.as_os_str().is_empty() {
-            self.start_scan(&root);
+        if self.refuse_if_scanning() {
+            return;
+        }
+        let target = self.cwd.clone();
+        if !target.as_os_str().is_empty() {
+            if target == self.root {
+                self.refresh();
+            } else {
+                self.scan_subtree(target);
+            }
         }
     }
 
-    /// Breadcrumb for the explorer: `Macintosh HD › Users › cesar`.
-    pub fn breadcrumb(&self) -> String {
+    pub fn rescan_root(&mut self) {
+        if self.refuse_if_scanning() {
+            return;
+        }
+        if !self.root.as_os_str().is_empty() {
+            self.refresh();
+        }
+    }
+
+    /// Say why a rescan key did nothing when one is already running.
+    fn refuse_if_scanning(&mut self) -> bool {
+        if self.session.is_none() {
+            return false;
+        }
+        self.status = Some("a scan is already running".into());
+        true
+    }
+
+    /// The path components that make up the explorer's breadcrumb.
+    pub fn breadcrumb_parts(&self) -> Vec<String> {
         let volume = self
             .filesystem
             .as_ref()
@@ -965,16 +2301,21 @@ impl App {
                     .map(|part| part.as_os_str().to_string_lossy().to_string()),
             );
         }
-        parts.join(" › ")
+        parts
+    }
+
+    /// Breadcrumb for the explorer: `Macintosh HD › Users › cesar`.
+    pub fn breadcrumb(&self) -> String {
+        self.breadcrumb_parts().join(" › ")
     }
 
     /// The sunburst for the current directory, plus the table taking a path
     /// back to the wedge that stands for it.
     ///
     /// Building it walks `rings` levels of the tree and clones a path per node,
-    /// which is far too much to redo for every keystroke — so the last one is
-    /// kept until something it was built from moves.
-    pub fn radial_tree(&self, rings: usize) -> Ref<'_, RadialCache> {
+    /// which is far too much to redo for every keystroke — so the last few
+    /// are kept until something they were built from moves.
+    pub fn radial_tree(&self, rings: usize) -> Arc<RadialCache> {
         let key = RadialKey {
             cwd: self.cwd.clone(),
             rings,
@@ -982,21 +2323,11 @@ impl App {
             metric: self.metric,
             revision: self.revision,
         };
-
-        let stale = match &*self.radial.borrow() {
-            Some(cache) => cache.key != key,
-            None => true,
-        };
-        if stale {
-            *self.radial.borrow_mut() = Some(self.build_radial(key));
-        }
-
-        Ref::map(self.radial.borrow(), |cache| {
-            cache.as_ref().expect("the cache was just filled")
-        })
+        self.radial
+            .get_or_build(key, |key| Arc::new(self.build_radial(key)))
     }
 
-    fn build_radial(&self, key: RadialKey) -> RadialCache {
+    fn build_radial(&self, key: &RadialKey) -> RadialCache {
         let mut ids = Vec::new();
 
         let root = if self.showing_growth() {
@@ -1009,19 +2340,34 @@ impl App {
             }
         } else {
             match self.current_entry() {
-                Some(entry) => build_radial(&self.cwd, entry, key.size_kind, key.rings, &mut ids),
+                Some(entry) => {
+                    // A wedge's arc is its share of the whole chart, so
+                    // anything smaller than this is too thin to be drawn.
+                    let total = entry.size(key.size_kind) as f64;
+                    let drawable = (total * LayoutOptions::default().min_span) as u64;
+                    build_radial(
+                        &self.cwd,
+                        entry,
+                        key.size_kind,
+                        key.rings,
+                        drawable,
+                        &mut ids,
+                    )
+                }
                 None => RadialNode::leaf(0, "", 0),
             }
         };
 
         RadialCache {
-            key,
+            rings: key.rings,
             root,
             ids: ids
                 .into_iter()
                 .enumerate()
                 .map(|(id, path)| (path, id))
                 .collect(),
+            visible: OnceLock::new(),
+            all: OnceLock::new(),
         }
     }
 
@@ -1029,6 +2375,14 @@ impl App {
     /// from it has to be built again.
     fn touch(&mut self) {
         self.revision = self.revision.wrapping_add(1);
+        // Nothing built from the tree as it was is asked for again.
+        self.radial.clear();
+        self.rows_cache.clear();
+        self.search_rows.clear();
+        self.measure_cache.clear();
+        self.search_measure.clear();
+        self.largest_cache.clear();
+        self.shortfall_cache.clear();
     }
 
     pub fn pick_selected_filesystem(&mut self) {
@@ -1049,58 +2403,109 @@ impl App {
     }
 }
 
-/// The part of `entry` the screen can still reach with the cursor at `cwd`:
-/// `below` levels under the cursor, and enough of the way back up that leaving
-/// the directory lists what it listed before.
-///
-/// Everything else is dropped. The numbers that survive are the same numbers
-/// the last scan produced — this trades depth the view is not showing for the
-/// memory a second full tree would need.
-fn visible_stub(path: &Path, entry: &DiskEntry, cwd: &Path, below: usize) -> DiskEntry {
-    let mut stub = entry.without_children();
-
-    if path.starts_with(cwd) {
-        // At or under the cursor: a few levels is everything that is drawn.
-        if below > 0 {
-            stub.children = entry
-                .children
-                .iter()
-                .map(|child| visible_stub(&path.join(child.name_os()), child, cwd, below - 1))
-                .collect();
+/// The deepest directory at or above both `a` and `b`, but never above `root`
+/// — the walk stops there even if the two targets otherwise share nothing.
+fn common_ancestor(a: &Path, b: &Path, root: &Path) -> PathBuf {
+    let mut candidate = a.to_path_buf();
+    while !b.starts_with(&candidate) {
+        if candidate == root || !candidate.pop() {
+            return root.to_path_buf();
         }
-    } else if cwd.starts_with(path) {
-        // Above the cursor: keep every child, so going back up still lists the
-        // same rows, but only follow the one that leads back down to it.
-        stub.children = entry
-            .children
-            .iter()
-            .map(|child| {
-                let child_path = path.join(child.name_os());
-                if cwd.starts_with(&child_path) {
-                    visible_stub(&child_path, child, cwd, below)
-                } else {
-                    child.without_children()
-                }
-            })
-            .collect();
     }
-
-    stub
+    candidate
 }
 
+/// True when `entry` is a directory whose numbers on screen are missing some
+/// of what it holds. A scanned directory counts itself plus exactly what its
+/// children count, and stubs, snapshot pruning and grafts keep `items`
+/// exact, so any shortfall is a listing that was cut. A directory a stopped
+/// scan did not finish is `Cancelled`, whether or not it lists anything.
+///
+/// A folder at the `--depth` limit is short too (the scan counted what it
+/// did not keep); `ensure_focus` leaves those alone through
+/// `subtree_scan_options`, since nothing below them would be kept either.
+fn lists_less_than_it_holds(entry: &DiskEntry) -> bool {
+    if entry.entry_type != disko_core::EntryType::Directory {
+        return false;
+    }
+    let listed: u64 = entry.children.iter().map(|child| child.items).sum();
+    entry.items > listed.saturating_add(1) || entry.scan_state() == ScanState::Cancelled
+}
+
+/// Cut `entry`, at `path`, down to the part the screen can still reach with
+/// the cursor at `cwd`: `below` levels under the cursor, and enough of the way
+/// back up that leaving the directory lists what it listed before.
+///
+/// Everything else goes into `cut`, for the caller to free elsewhere. The
+/// numbers that survive are the same numbers the last scan produced — this
+/// trades depth the view is not showing for the memory a second full tree
+/// would need. It works in place: copying the kept part was a pause on the UI
+/// thread at every rescan.
+fn trim_to_visible(
+    path: &mut PathBuf,
+    entry: &mut DiskEntry,
+    cwd: &Path,
+    below: usize,
+    cut: &mut Vec<Vec<DiskEntry>>,
+) {
+    if path.starts_with(cwd) {
+        // At or under the cursor: a few levels is everything that is drawn.
+        if below == 0 {
+            cut_children(entry, cut);
+            return;
+        }
+        for child in &mut entry.children {
+            path.push(child.name_os());
+            trim_to_visible(path, child, cwd, below - 1, cut);
+            path.pop();
+        }
+    } else if cwd.starts_with(&*path) {
+        // Above the cursor: keep every child, so going back up still lists the
+        // same rows, but only follow the one that leads back down to it.
+        for child in &mut entry.children {
+            path.push(child.name_os());
+            if cwd.starts_with(&*path) {
+                trim_to_visible(path, child, cwd, below, cut);
+            } else {
+                cut_children(child, cut);
+            }
+            path.pop();
+        }
+    } else {
+        cut_children(entry, cut);
+    }
+}
+
+/// Move `entry`'s children into `cut`; a file's empty list is not worth it.
+fn cut_children(entry: &mut DiskEntry, cut: &mut Vec<Vec<DiskEntry>>) {
+    if !entry.children.is_empty() {
+        cut.push(std::mem::take(&mut entry.children));
+    }
+}
+
+/// The sunburst under `entry`, `rings` deep. Every child of the folder on
+/// screen (id 0) gets a node, since any of them can be the selected row, which
+/// the layout places however thin it is. Further out, entries under
+/// `drawable` bytes are left out: the layout skips them and everything inside
+/// them, and a big folder holds hundreds of thousands of them.
 fn build_radial(
     path: &Path,
     entry: &DiskEntry,
     kind: SizeKind,
     rings: usize,
+    drawable: u64,
     ids: &mut Vec<PathBuf>,
 ) -> RadialNode {
     let id = ids.len();
     ids.push(path.to_path_buf());
 
     let mut children = Vec::new();
-    if rings > 0 {
-        let mut sorted: Vec<&DiskEntry> = entry.children.iter().collect();
+    if rings > 0 && entry.size(kind) >= drawable {
+        let mut sorted: Vec<&DiskEntry> = entry
+            .children
+            .iter()
+            .filter(|child| id == 0 || child.size(kind) >= drawable)
+            .collect();
         sorted.sort_by(|a, b| {
             b.size(kind)
                 .cmp(&a.size(kind))
@@ -1108,7 +2513,16 @@ fn build_radial(
         });
         children = sorted
             .into_iter()
-            .map(|child| build_radial(&path.join(child.name_os()), child, kind, rings - 1, ids))
+            .map(|child| {
+                build_radial(
+                    &path.join(child.name_os()),
+                    child,
+                    kind,
+                    rings - 1,
+                    drawable,
+                    ids,
+                )
+            })
             .collect();
     }
 
@@ -1175,6 +2589,25 @@ mod tests {
     use super::*;
     use disko_core::EntryType;
 
+    /// `land_in_background`, except that a scan which has already finished
+    /// has also landed when this returns, as tests that poll once expect.
+    fn landing(scan: JoinHandle<Result<DiskEntry>>, compare: Compare) -> Landing {
+        let finished = scan.is_finished();
+        let landing = land_in_background(scan, compare);
+        while finished && !landing.is_finished() {
+            std::thread::yield_now();
+        }
+        landing
+    }
+
+    /// Hand `scan` to the running session the way `begin` and
+    /// `scan_subtree` do, so it lands through the same comparison.
+    fn hand_over(app: &mut App, scan: JoinHandle<Result<DiskEntry>>) {
+        let kind = app.session.as_ref().unwrap().kind;
+        let landing = landing(scan, app.compare_for(kind));
+        app.session.as_mut().unwrap().handle = Some(landing);
+    }
+
     fn settings() -> Settings {
         Settings {
             size_kind: SizeKind::Allocated,
@@ -1198,60 +2631,77 @@ mod tests {
     /// An app with a canned tree, skipping the real scan.
     fn app_with_tree() -> App {
         let tree = entry(
-            "/root",
+            "/disko-test-root",
             1000,
             vec![
                 entry(
-                    "/root/big",
+                    "/disko-test-root/big",
                     700,
-                    vec![entry("/root/big/inner", 500, vec![])],
+                    vec![entry("/disko-test-root/big/inner", 500, vec![])],
                 ),
-                entry("/root/small", 300, vec![]),
+                entry("/disko-test-root/small", 300, vec![]),
             ],
         );
         let mut app = App::new(settings(), false);
-        app.root = PathBuf::from("/root");
-        app.cwd = PathBuf::from("/root");
+        app.root = PathBuf::from("/disko-test-root");
+        app.cwd = PathBuf::from("/disko-test-root");
         app.tree = Some(tree);
         app.view = View::Overview;
         app
     }
 
-    /// `/root` -> `a` -> `deep` -> `deeper`, with a sibling at every level, so
+    /// `/disko-test-root` -> `a` -> `deep` -> `deeper`, with a sibling at every level, so
     /// a stub can be checked for both what it keeps and what it lets go.
     fn deep_tree() -> DiskEntry {
         entry(
-            "/root",
+            "/disko-test-root",
             1000,
             vec![
                 entry(
-                    "/root/a",
+                    "/disko-test-root/a",
                     700,
                     vec![
                         entry(
-                            "/root/a/deep",
+                            "/disko-test-root/a/deep",
                             600,
                             vec![entry(
-                                "/root/a/deep/deeper",
+                                "/disko-test-root/a/deep/deeper",
                                 500,
-                                vec![entry("/root/a/deep/deeper/deepest", 400, vec![])],
+                                vec![entry("/disko-test-root/a/deep/deeper/deepest", 400, vec![])],
                             )],
                         ),
                         entry(
-                            "/root/a/sibling",
+                            "/disko-test-root/a/sibling",
                             100,
-                            vec![entry("/root/a/sibling/x", 1, vec![])],
+                            vec![entry("/disko-test-root/a/sibling/x", 1, vec![])],
                         ),
                     ],
                 ),
-                entry("/root/b", 300, vec![entry("/root/b/hidden", 50, vec![])]),
+                entry(
+                    "/disko-test-root/b",
+                    300,
+                    vec![entry("/disko-test-root/b/hidden", 50, vec![])],
+                ),
             ],
         )
     }
 
+    /// `deep_tree` cut down for the cursor at `cwd`.
+    fn trimmed(cwd: &str, below: usize) -> DiskEntry {
+        let mut tree = deep_tree();
+        trim_to_visible(
+            &mut PathBuf::from("/disko-test-root"),
+            &mut tree,
+            Path::new(cwd),
+            below,
+            &mut Vec::new(),
+        );
+        tree
+    }
+
     #[test]
     fn a_stub_keeps_the_levels_under_the_cursor() {
-        let stub = visible_stub(Path::new("/root"), &deep_tree(), Path::new("/root/a"), 2);
+        let stub = trimmed("/disko-test-root/a", 2);
         let a = stub.child("a").unwrap();
 
         // Two levels under the cursor survive with their sizes intact...
@@ -1267,9 +2717,9 @@ mod tests {
 
     #[test]
     fn a_stub_keeps_enough_to_go_back_up() {
-        let stub = visible_stub(Path::new("/root"), &deep_tree(), Path::new("/root/a"), 2);
+        let stub = trimmed("/disko-test-root/a", 2);
 
-        // Leaving `/root/a` must still list the same rows it listed before,
+        // Leaving `/disko-test-root/a` must still list the same rows it listed before,
         // with the same numbers, even though nothing under them is kept.
         let b = stub.child("b").unwrap();
         assert_eq!(b.allocated_size, 300);
@@ -1281,7 +2731,7 @@ mod tests {
 
     #[test]
     fn a_stub_at_the_root_is_bounded_by_depth() {
-        let stub = visible_stub(Path::new("/root"), &deep_tree(), Path::new("/root"), 1);
+        let stub = trimmed("/disko-test-root", 1);
 
         assert_eq!(stub.allocated_size, 1000);
         assert_eq!(stub.children.len(), 2);
@@ -1292,8 +2742,8 @@ mod tests {
     #[test]
     fn rescanning_drops_the_old_tree_down_to_the_stub() {
         let mut app = app_with_tree();
-        app.cwd = PathBuf::from("/root");
-        app.begin(&PathBuf::from("/root"), ScanMode::Refresh);
+        app.cwd = PathBuf::from("/disko-test-root");
+        app.begin(&PathBuf::from("/disko-test-root"), ScanMode::Refresh);
 
         // The rescan is under way and the view still has its numbers, but the
         // full tree is no longer being held alongside the one being built.
@@ -1309,7 +2759,7 @@ mod tests {
         app.selection = 0; // "big" is largest, so it is first
         app.open_selected();
 
-        assert_eq!(app.cwd, PathBuf::from("/root/big"));
+        assert_eq!(app.cwd, PathBuf::from("/disko-test-root/big"));
         assert_eq!(app.selection, 0);
         assert_eq!(app.rows().len(), 1);
     }
@@ -1317,10 +2767,10 @@ mod tests {
     #[test]
     fn going_up_lands_back_on_the_directory_just_left() {
         let mut app = app_with_tree();
-        app.cwd = PathBuf::from("/root/small");
+        app.cwd = PathBuf::from("/disko-test-root/small");
         app.go_up();
 
-        assert_eq!(app.cwd, PathBuf::from("/root"));
+        assert_eq!(app.cwd, PathBuf::from("/disko-test-root"));
         assert_eq!(app.selected_row().unwrap().name, "small");
     }
 
@@ -1328,7 +2778,7 @@ mod tests {
     fn the_scan_root_is_the_floor() {
         let mut app = app_with_tree();
         app.go_up();
-        assert_eq!(app.cwd, PathBuf::from("/root"));
+        assert_eq!(app.cwd, PathBuf::from("/disko-test-root"));
         assert!(app.status.is_some());
     }
 
@@ -1367,9 +2817,9 @@ mod tests {
     #[test]
     fn the_breadcrumb_follows_the_current_directory() {
         let mut app = app_with_tree();
-        assert_eq!(app.breadcrumb(), "/root");
-        app.cwd = PathBuf::from("/root/big/inner");
-        assert_eq!(app.breadcrumb(), "/root › big › inner");
+        assert_eq!(app.breadcrumb(), "/disko-test-root");
+        app.cwd = PathBuf::from("/disko-test-root/big/inner");
+        assert_eq!(app.breadcrumb(), "/disko-test-root › big › inner");
     }
 
     #[test]
@@ -1380,10 +2830,10 @@ mod tests {
         assert_eq!(cache.root.size, 1000);
         // Largest first, depth first.
         for (id, path) in [
-            (0, "/root"),
-            (1, "/root/big"),
-            (2, "/root/big/inner"),
-            (3, "/root/small"),
+            (0, "/disko-test-root"),
+            (1, "/disko-test-root/big"),
+            (2, "/disko-test-root/big/inner"),
+            (3, "/disko-test-root/small"),
         ] {
             assert_eq!(cache.id_of(Path::new(path)), Some(id), "{path}");
         }
@@ -1413,11 +2863,17 @@ mod tests {
 
         // ...but editing the tree does not.
         app.apply_outcomes(vec![Outcome::Deleted {
-            path: PathBuf::from("/root/small"),
-            size: 300,
+            path: PathBuf::from("/disko-test-root/small"),
+            freed: 300,
+            tree_needs_rescan: false,
+            links_survived: false,
         }]);
         assert_eq!(app.revision, 1);
-        assert_eq!(app.radial_tree(2).id_of(Path::new("/root/small")), None);
+        assert_eq!(
+            app.radial_tree(2)
+                .id_of(Path::new("/disko-test-root/small")),
+            None
+        );
     }
 
     #[test]
@@ -1429,7 +2885,7 @@ mod tests {
         app.selection = 1;
         app.open_selected();
 
-        assert_eq!(app.cwd, PathBuf::from("/root"));
+        assert_eq!(app.cwd, PathBuf::from("/disko-test-root"));
         assert!(app.status.unwrap().contains("is a file"));
     }
 
@@ -1444,5 +2900,1727 @@ mod tests {
         assert_eq!(app.settings.size_kind, SizeKind::Apparent);
         // Now "small" is the biggest by apparent size.
         assert_eq!(app.rows()[0].name, "small");
+    }
+
+    #[test]
+    fn nested_marks_are_pruned_before_deletion() {
+        let mut app = app_with_tree();
+        app.marks.insert(PathBuf::from("/disko-test-root/big"));
+        app.marks
+            .insert(PathBuf::from("/disko-test-root/big/inner"));
+        app.request_delete();
+
+        let confirm = app.confirm.as_ref().unwrap();
+        assert_eq!(confirm.targets.len(), 1);
+        assert_eq!(
+            confirm.targets[0].path,
+            PathBuf::from("/disko-test-root/big")
+        );
+    }
+
+    #[test]
+    fn deletion_cannot_start_while_a_scan_can_still_replace_the_tree() {
+        let mut app = app_with_tree();
+        let handle =
+            std::thread::spawn(|| Ok(DiskEntry::new("/disko-test-root", EntryType::Directory)));
+        app.session = Some(Session {
+            scanned_path: PathBuf::from("/disko-test-root"),
+            kind: SessionKind::Root,
+            progress: Arc::new(Progress::default()),
+            cancel: Cancel::new(),
+            handle: Some(landing(handle, app.compare_for(SessionKind::Root))),
+            started: Instant::now(),
+            discard_on_finish: false,
+        });
+
+        app.request_delete();
+
+        assert!(app.confirm.is_none());
+        assert!(app.status.as_deref().unwrap().contains("scan to finish"));
+    }
+
+    #[test]
+    fn an_armed_confirmation_is_rechecked_if_a_scan_started_after_it_opened() {
+        let mut app = app_with_tree();
+        app.request_delete();
+        app.confirm.as_mut().unwrap().typed = CONFIRM_WORD.to_string();
+        let handle =
+            std::thread::spawn(|| Ok(DiskEntry::new("/disko-test-root", EntryType::Directory)));
+        app.session = Some(Session {
+            scanned_path: PathBuf::from("/disko-test-root"),
+            kind: SessionKind::Root,
+            progress: Arc::new(Progress::default()),
+            cancel: Cancel::new(),
+            handle: Some(landing(handle, app.compare_for(SessionKind::Root))),
+            started: Instant::now(),
+            discard_on_finish: false,
+        });
+
+        app.commit_delete();
+
+        assert!(app.deleting.is_none());
+        assert!(app.confirm.is_some());
+    }
+
+    #[test]
+    fn an_armed_confirmation_blocks_a_background_refresh() {
+        let mut app = app_with_tree();
+        app.request_delete();
+        app.confirm.as_mut().unwrap().typed = CONFIRM_WORD.to_string();
+
+        app.refresh();
+
+        assert!(app.session.is_none());
+        assert!(app.confirm.is_some());
+    }
+
+    #[test]
+    fn a_partial_deletion_starts_a_rescan_before_the_tree_is_trusted_again() {
+        let mut app = app_with_tree();
+        app.metric = Metric::Growth;
+        app.diff = Some(disko_core::diff::diff(
+            app.tree.as_ref().unwrap(),
+            app.tree.as_ref().unwrap(),
+            SizeKind::Allocated,
+            0,
+            1,
+            0,
+        ));
+
+        app.apply_outcomes(vec![Outcome::Failed {
+            path: PathBuf::from("/disko-test-root/big"),
+            error: "stopped part-way through".into(),
+            removed_bytes: 0,
+            removed_entries: 0,
+            tree_may_have_changed: true,
+            links_survived: false,
+        }]);
+
+        assert!(app.session.is_some());
+        assert!(app.diff.is_none());
+        assert_eq!(app.metric, Metric::Size);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .contains("deletion incomplete")
+        );
+        app.cancel_scan();
+    }
+
+    #[test]
+    fn deletion_accounting_drift_starts_a_rescan() {
+        let mut app = app_with_tree();
+
+        app.apply_outcomes(vec![Outcome::Deleted {
+            path: PathBuf::from("/disko-test-root/small"),
+            freed: 0,
+            tree_needs_rescan: true,
+            links_survived: false,
+        }]);
+
+        assert!(app.session.is_some());
+        // The drifted target's parent is the scan root itself here, so this
+        // is indistinguishable from the full-refresh case the next test
+        // isolates for a target whose parent is a strict subtree.
+        assert_eq!(app.scanned_path(), Some(Path::new("/disko-test-root")));
+        app.cancel_scan();
+    }
+
+    #[test]
+    fn a_deleted_targets_undercount_forces_a_full_rescan_even_under_a_strict_subtree() {
+        let mut app = app_with_tree();
+
+        // freed (0) short of the 500 the tree believed `inner` held: with no
+        // surviving link to explain it, something outside disko changed the
+        // disk since the scan, so the whole tree is rescanned.
+        app.apply_outcomes(vec![Outcome::Deleted {
+            path: PathBuf::from("/disko-test-root/big/inner"),
+            freed: 0,
+            tree_needs_rescan: true,
+            links_survived: false,
+        }]);
+
+        assert!(app.session.is_some());
+        assert_eq!(
+            app.scanned_path(),
+            Some(Path::new("/disko-test-root")),
+            "a scoped rescan of the target's parent could miss a surviving hard link elsewhere"
+        );
+        app.cancel_scan();
+    }
+
+    #[test]
+    fn growth_after_a_stopped_scan_says_the_count_is_partial() {
+        let mut app = app_with_tree();
+        app.rescan_root();
+
+        let mut partial = DiskEntry::new(PathBuf::from("/disko-test-root"), EntryType::Directory);
+        partial.set_scan_state(ScanState::Cancelled);
+        let handle = std::thread::spawn(move || Ok(partial));
+        while !handle.is_finished() {
+            std::thread::yield_now();
+        }
+        hand_over(&mut app, handle);
+        app.cancel_background_scan();
+        app.poll_scan();
+        app.toggle_metric();
+
+        assert!(app.diff.is_none());
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("partial count")),
+            "status was: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn growth_after_a_deletion_says_the_totals_changed_instead_of_no_earlier_scan() {
+        let delete_small = |app: &mut App| {
+            app.apply_outcomes(vec![Outcome::Deleted {
+                path: PathBuf::from("/disko-test-root/small"),
+                freed: 300,
+                tree_needs_rescan: false,
+                links_survived: false,
+            }]);
+            app.toggle_metric();
+            app.status.clone().unwrap_or_default()
+        };
+
+        // Without snapshots or a diff, a rescan has nothing to compare with.
+        let mut app = app_with_tree();
+        app.toggle_metric();
+        assert_eq!(
+            app.status.as_deref(),
+            Some("no earlier scan to compare against")
+        );
+        assert_eq!(delete_small(&mut app), "no earlier scan to compare against");
+
+        let mut app = app_with_tree();
+        app.settings.record_snapshots = true;
+        let status = delete_small(&mut app);
+        assert!(
+            status.contains("totals changed since the scan"),
+            "status was: {status:?}"
+        );
+
+        // A scan of a different root starts clean.
+        let elsewhere = PathBuf::from("/disko-test-missing-root");
+        app.start_scan(&elsewhere);
+        app.tree = Some(DiskEntry::new(elsewhere, EntryType::Directory));
+        app.toggle_metric();
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("now the baseline")),
+            "status was: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_hard_link_split_across_two_targets_rescans_only_their_parent() {
+        let mut app = app_with_tree();
+        app.tree = Some(deep_tree());
+
+        // The scan credited the shared file to `deeper`, which freed nothing;
+        // `sibling` removed the last link and freed it. The batch total
+        // matches, so no bytes are missing anywhere.
+        app.apply_outcomes(vec![
+            Outcome::Deleted {
+                path: PathBuf::from("/disko-test-root/a/deep/deeper"),
+                freed: 0,
+                tree_needs_rescan: true,
+                links_survived: false,
+            },
+            Outcome::Deleted {
+                path: PathBuf::from("/disko-test-root/a/sibling"),
+                freed: 600,
+                tree_needs_rescan: true,
+                links_survived: false,
+            },
+        ]);
+
+        assert_eq!(app.scanned_path(), Some(Path::new("/disko-test-root/a")));
+        app.cancel_scan();
+    }
+
+    #[test]
+    fn a_failed_deletions_drift_rescans_only_the_targets_parent() {
+        let mut app = app_with_tree();
+
+        app.apply_outcomes(vec![Outcome::Failed {
+            path: PathBuf::from("/disko-test-root/big/inner"),
+            error: "stopped part-way through".into(),
+            removed_bytes: 0,
+            removed_entries: 0,
+            tree_may_have_changed: true,
+            links_survived: false,
+        }]);
+
+        assert!(app.session.is_some());
+        assert_eq!(
+            app.scanned_path(),
+            Some(Path::new("/disko-test-root/big")),
+            "a whole-root refresh would block deletion under / until the full disk rescans"
+        );
+        app.cancel_scan();
+    }
+
+    #[test]
+    fn a_failed_deletions_surviving_link_forces_a_full_rescan() {
+        let mut app = app_with_tree();
+
+        app.apply_outcomes(vec![Outcome::Failed {
+            path: PathBuf::from("/disko-test-root/big/inner"),
+            error: "stopped part-way through".into(),
+            removed_bytes: 100,
+            removed_entries: 1,
+            tree_may_have_changed: true,
+            links_survived: true,
+        }]);
+
+        assert!(app.session.is_some());
+        assert_eq!(
+            app.scanned_path(),
+            Some(Path::new("/disko-test-root")),
+            "a failed deletion that still unlinked a surviving link needs the whole tree, \
+             not just its own parent"
+        );
+        app.cancel_scan();
+    }
+
+    #[test]
+    fn two_failed_deletions_drift_rescans_their_common_ancestor() {
+        let mut app = app_with_tree();
+
+        app.apply_outcomes(vec![
+            Outcome::Failed {
+                path: PathBuf::from("/disko-test-root/big/inner"),
+                error: "stopped part-way through".into(),
+                removed_bytes: 0,
+                removed_entries: 0,
+                tree_may_have_changed: true,
+                links_survived: false,
+            },
+            Outcome::Failed {
+                path: PathBuf::from("/disko-test-root/small"),
+                error: "stopped part-way through".into(),
+                removed_bytes: 0,
+                removed_entries: 0,
+                tree_may_have_changed: true,
+                links_survived: false,
+            },
+        ]);
+
+        assert!(app.session.is_some());
+        assert_eq!(app.scanned_path(), Some(Path::new("/disko-test-root")));
+        app.cancel_scan();
+    }
+
+    #[test]
+    fn a_deleted_targets_overcount_still_gets_only_a_scoped_rescan() {
+        let mut app = app_with_tree();
+
+        // freed (600) at or above the 500 the tree believed `inner` held —
+        // not a hard link surviving elsewhere, so the narrower scoped rescan
+        // still applies.
+        app.apply_outcomes(vec![Outcome::Deleted {
+            path: PathBuf::from("/disko-test-root/big/inner"),
+            freed: 600,
+            tree_needs_rescan: true,
+            links_survived: false,
+        }]);
+
+        assert!(app.session.is_some());
+        assert_eq!(app.scanned_path(), Some(Path::new("/disko-test-root/big")));
+        app.cancel_scan();
+    }
+
+    #[test]
+    fn deleting_a_pruned_parent_clears_descendant_marks() {
+        let mut app = app_with_tree();
+        app.marks.insert(PathBuf::from("/disko-test-root/big"));
+        app.marks
+            .insert(PathBuf::from("/disko-test-root/big/inner"));
+        app.request_delete();
+
+        app.apply_outcomes(vec![Outcome::Deleted {
+            path: PathBuf::from("/disko-test-root/big"),
+            freed: 700,
+            tree_needs_rescan: false,
+            links_survived: false,
+        }]);
+
+        assert!(
+            app.marks.is_empty(),
+            "deleted descendants cannot remain marked"
+        );
+    }
+
+    #[test]
+    fn deleting_current_directory_ascends_to_surviving_ancestor() {
+        let mut app = app_with_tree();
+        app.cwd = PathBuf::from("/disko-test-root/big/inner");
+        assert_eq!(app.current_entry().unwrap().name(), "inner");
+
+        app.apply_outcomes(vec![Outcome::Deleted {
+            path: PathBuf::from("/disko-test-root/big/inner"),
+            freed: 200,
+            tree_needs_rescan: false,
+            links_survived: false,
+        }]);
+
+        assert_eq!(app.cwd, PathBuf::from("/disko-test-root/big"));
+        assert!(app.current_entry().is_some());
+    }
+
+    #[test]
+    fn deletion_invalidates_growth_diff_and_resets_metric() {
+        let mut app = app_with_tree();
+        app.metric = Metric::Growth;
+        app.diff = Some(disko_core::diff::diff(
+            app.tree.as_ref().unwrap(),
+            app.tree.as_ref().unwrap(),
+            SizeKind::Allocated,
+            0,
+            1,
+            0,
+        ));
+
+        app.apply_outcomes(vec![Outcome::Deleted {
+            path: PathBuf::from("/disko-test-root/small"),
+            freed: 300,
+            tree_needs_rescan: false,
+            links_survived: false,
+        }]);
+
+        assert!(app.diff.is_none());
+        assert_eq!(app.metric, Metric::Size);
+    }
+
+    #[test]
+    fn subtree_graft_updates_deep_branch_and_preserves_root() {
+        let mut app = app_with_tree();
+        let mut inner_graft = DiskEntry::new(
+            PathBuf::from("/disko-test-root/big/inner"),
+            EntryType::Directory,
+        );
+        let mut new_file = DiskEntry::new("nested.txt", EntryType::File);
+        new_file.allocated_size = 800;
+        new_file.apparent_size = 800;
+        new_file.items = 1;
+        inner_graft.children.push(new_file);
+        inner_graft.allocated_size = 800;
+        inner_graft.apparent_size = 800;
+        inner_graft.items = 2;
+
+        assert!(
+            app.tree
+                .as_mut()
+                .unwrap()
+                .graft(Path::new("/disko-test-root/big/inner"), inner_graft)
+                .is_ok()
+        );
+        assert_eq!(
+            app.tree
+                .as_ref()
+                .unwrap()
+                .resolve(Path::new("/disko-test-root/big/inner/nested.txt"))
+                .unwrap()
+                .allocated_size,
+            800
+        );
+        // Original inner was 500; replaced with 800 (+300). Root was 1000, now 1300.
+        assert_eq!(app.tree.as_ref().unwrap().allocated_size, 1300);
+    }
+
+    #[test]
+    fn subtree_rescan_does_not_leave_the_old_growth_diff_visible() {
+        let mut app = app_with_tree();
+        app.cwd = PathBuf::from("/disko-test-root/big");
+        app.metric = Metric::Growth;
+        app.diff = Some(disko_core::diff::diff(
+            app.tree.as_ref().unwrap(),
+            app.tree.as_ref().unwrap(),
+            SizeKind::Allocated,
+            0,
+            1,
+            0,
+        ));
+
+        let mut replacement =
+            DiskEntry::new(PathBuf::from("/disko-test-root/big"), EntryType::Directory);
+        replacement.allocated_size = 900;
+        replacement.apparent_size = 900;
+        let handle = std::thread::spawn(move || Ok(replacement));
+        while !handle.is_finished() {
+            std::thread::yield_now();
+        }
+        app.session = Some(Session {
+            scanned_path: PathBuf::from("/disko-test-root/big"),
+            kind: SessionKind::Subtree,
+            progress: Arc::new(Progress::default()),
+            cancel: Cancel::new(),
+            handle: Some(landing(handle, Compare::Nothing)),
+            started: Instant::now(),
+            discard_on_finish: false,
+        });
+
+        app.poll_scan();
+
+        assert!(
+            !app.showing_growth(),
+            "the pre-rescan diff is stale after grafting"
+        );
+    }
+
+    #[test]
+    fn cancelling_a_background_scan_leaves_the_screen_unchanged_and_deletion_allowed() {
+        let mut app = app_with_tree();
+        app.cwd = PathBuf::from("/disko-test-root/big");
+
+        // A rescan that would have replaced `big` with different totals, were
+        // it allowed to land.
+        let mut replacement =
+            DiskEntry::new(PathBuf::from("/disko-test-root/big"), EntryType::Directory);
+        replacement.allocated_size = 900;
+        replacement.apparent_size = 900;
+        let handle = std::thread::spawn(move || Ok(replacement));
+        while !handle.is_finished() {
+            std::thread::yield_now();
+        }
+        app.session = Some(Session {
+            scanned_path: PathBuf::from("/disko-test-root/big"),
+            kind: SessionKind::Subtree,
+            progress: Arc::new(Progress::default()),
+            cancel: Cancel::new(),
+            handle: Some(landing(handle, Compare::Nothing)),
+            started: Instant::now(),
+            discard_on_finish: false,
+        });
+
+        app.cancel_background_scan();
+        app.poll_scan();
+
+        assert!(app.session.is_none());
+        assert_eq!(
+            app.tree
+                .as_ref()
+                .unwrap()
+                .resolve(&app.cwd)
+                .unwrap()
+                .allocated_size,
+            700,
+            "the pre-scan tree must survive a cancel untouched"
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("unchanged")),
+            "status was: {:?}",
+            app.status
+        );
+
+        // Deletion is refused only while `session` is set; cancelling clears
+        // it, so a delete request right after must not be turned away for
+        // "wait for the scan to finish".
+        app.request_delete();
+        assert!(
+            app.status
+                .as_deref()
+                .is_none_or(|s| !s.contains("wait for the scan")),
+            "status was: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn cancelling_a_root_rescan_absorbs_the_partial_tree_instead_of_the_stub() {
+        let mut app = app_with_tree();
+        app.watch = Some(Watch::new(60));
+        // Backdated well past due, so a bug that leaves `last_scan` untouched
+        // would still show `is_due()` true after cancelling — only the fix
+        // moving the clock makes the assertion below discriminate.
+        app.watch.as_mut().unwrap().last_scan = Instant::now() - Duration::from_secs(120);
+
+        app.rescan_root();
+        assert!(app.session.is_some());
+
+        // What the background scan actually counted before `z` stopped it —
+        // smaller than the original tree, standing in for a partial result.
+        let mut partial = DiskEntry::new(PathBuf::from("/disko-test-root"), EntryType::Directory);
+        partial.allocated_size = 400;
+        partial.apparent_size = 400;
+        partial.children = vec![{
+            let mut small =
+                DiskEntry::new(PathBuf::from("/disko-test-root/small"), EntryType::File);
+            small.allocated_size = 400;
+            small.apparent_size = 400;
+            small
+        }];
+        partial.set_scan_state(ScanState::Cancelled);
+        let handle = std::thread::spawn(move || Ok(partial));
+        while !handle.is_finished() {
+            std::thread::yield_now();
+        }
+        hand_over(&mut app, handle);
+        // `z` arrives while the scan is still counting. The scan
+        // `rescan_root` started (of a path that does not exist) is long done,
+        // so its progress would say the count is over.
+        app.session.as_mut().unwrap().progress = Arc::new(Progress::default());
+
+        app.cancel_background_scan();
+        app.poll_scan();
+
+        assert!(app.session.is_none());
+        let tree = app.tree.as_ref().unwrap();
+        assert_eq!(
+            tree.allocated_size, 400,
+            "the scan's own partial result must land, not the pre-scan stub"
+        );
+        assert_eq!(
+            tree.children.len(),
+            1,
+            "the stub's empty child list must not be what gets kept"
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("counted so far")),
+            "status was: {:?}",
+            app.status
+        );
+
+        // Watch mode's clock must move the same way a finished scan moves it,
+        // or the very next tick fires another rescan immediately.
+        assert!(
+            !app.watch.as_ref().unwrap().is_due(),
+            "cancelling a root rescan must not leave watch mode ready to fire again instantly"
+        );
+        // A partial count is not a watch round and must not feed a diff.
+        assert_eq!(app.watch.as_ref().unwrap().rounds, 0);
+        assert!(app.watch.as_ref().unwrap().baseline.is_none());
+        assert!(app.diff.is_none());
+        app.toggle_metric();
+        assert!(
+            app.status.as_deref().is_some_and(|s| s.contains("stopped")),
+            "status was: {:?}",
+            app.status
+        );
+
+        // Deletion is refused only while `session` is set.
+        app.request_delete();
+        assert!(
+            app.status
+                .as_deref()
+                .is_none_or(|s| !s.contains("wait for the scan")),
+            "status was: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn cancelling_z_is_refused_while_the_screen_is_still_provisional() {
+        let mut app = app_with_tree();
+        app.start_scan(Path::new("/disko-test-root"));
+        assert!(app.provisional.is_some() || app.session.is_some());
+        // Force the provisional state directly: whether a snapshot happened
+        // to exist for this path is environment-dependent, but the refusal
+        // must hold whenever the screen is painted from one.
+        app.provisional = Some(0);
+
+        app.cancel_background_scan();
+
+        // `session.is_some()` alone would also hold on the root-cancel path —
+        // `z` leaves `session` set there too, only its cancel token flips —
+        // so check the token itself was never touched.
+        assert!(
+            app.session
+                .as_ref()
+                .is_some_and(|session| !session.cancel.is_cancelled()),
+            "a provisional screen must not let `z` touch the running session"
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| !s.contains("stopping")),
+            "status was: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn subtree_scan_depth_is_relative_to_the_original_root() {
+        let mut app = app_with_tree();
+        app.settings.scan_options.max_depth = Some(2);
+
+        let options = app.subtree_scan_options(Path::new("/disko-test-root/big"));
+
+        assert_eq!(options.max_depth, Some(1));
+    }
+
+    #[test]
+    fn a_skipped_mount_is_not_rescanned_as_its_own_root() {
+        let mut app = app_with_tree();
+        let tree = app.tree.as_mut().unwrap();
+        let small = tree
+            .children
+            .iter_mut()
+            .find(|c| c.name() == "small")
+            .unwrap();
+        small.set_scan_state(ScanState::Skipped);
+        app.cwd = PathBuf::from("/disko-test-root/small");
+
+        app.rescan();
+
+        assert!(
+            app.session.is_none(),
+            "the skipped mount must not be walked"
+        );
+        assert!(app.status.as_deref().is_some_and(|s| s.contains("skipped")));
+    }
+
+    #[test]
+    fn a_running_scan_is_shown_only_for_folders_it_covers() {
+        let mut app = app_with_tree();
+        app.scan_subtree(PathBuf::from("/disko-test-root/big"));
+
+        app.cwd = PathBuf::from("/disko-test-root/big/inner");
+        assert!(app.cwd_is_being_scanned());
+        app.cwd = PathBuf::from("/disko-test-root/small");
+        assert!(
+            !app.cwd_is_being_scanned(),
+            "a sibling is not being rescanned"
+        );
+        app.cancel_scan();
+    }
+
+    #[test]
+    fn the_deletion_hint_names_the_outcome_that_changed_the_tree() {
+        let outcomes = vec![
+            Outcome::Refused {
+                path: PathBuf::from("/r/refused"),
+                reason: deletion::Refusal::OutsideScan,
+            },
+            Outcome::Failed {
+                path: PathBuf::from("/r/interrupted"),
+                error: "stopped".into(),
+                removed_bytes: 10,
+                removed_entries: 1,
+                tree_may_have_changed: true,
+                links_survived: false,
+            },
+        ];
+
+        let status = deletion_status(0, 2, 10, &outcomes, Unit::Decimal);
+
+        assert!(status.starts_with("deletion incomplete"), "{status}");
+        assert!(status.contains("interrupted"), "{status}");
+    }
+
+    #[test]
+    fn watch_mode_keeps_showing_growth_after_a_deletion() {
+        let mut app = app_with_tree().watching(Watch::new(5));
+        app.diff = Some(disko_core::diff::diff(
+            app.tree.as_ref().unwrap(),
+            app.tree.as_ref().unwrap(),
+            SizeKind::Allocated,
+            0,
+            0,
+            0,
+        ));
+
+        app.finish_tree_mutation();
+
+        assert_eq!(app.metric, Metric::Growth);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_replaced_by_a_symlink_since_the_scan_refuses_the_rescan() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        // A real directory that stood in for the tree's `big` child at scan
+        // time, and a second directory the tree knows nothing about.
+        let base =
+            std::env::temp_dir().join(format!("disko-scan-subtree-symlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let original = base.join("original");
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir_all(&original).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::remove_dir(&original).unwrap();
+        symlink(&elsewhere, &original).unwrap();
+
+        let mut app = app_with_tree();
+
+        app.scan_subtree(original.clone());
+
+        assert!(
+            app.session.is_none(),
+            "a path that no longer resolves to itself must not be rescanned"
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("points somewhere else")),
+            "status was: {:?}",
+            app.status
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A real folder tree, and an app showing it as a stub whose `deep` and
+    /// `other` children are unlisted, with a root scan that stays running
+    /// until the returned sender is dropped.
+    fn browsing_ahead_of_a_root_scan(tag: &str) -> (App, PathBuf, std::sync::mpsc::Sender<()>) {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("disko-focus-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("deep/inner/b")).unwrap();
+        fs::create_dir_all(base.join("other")).unwrap();
+        fs::write(base.join("deep/inner/a.bin"), vec![b'x'; 1000]).unwrap();
+        fs::write(base.join("deep/inner/b/c.bin"), vec![b'x'; 500]).unwrap();
+        fs::write(base.join("other/d.bin"), vec![b'x'; 10]).unwrap();
+        let base = base.canonicalize().unwrap();
+
+        let unlisted = |name: &str, items| {
+            let mut child = DiskEntry::new(name, EntryType::Directory);
+            child.items = items;
+            child
+        };
+        let mut root = DiskEntry::new(&base, EntryType::Directory);
+        root.children = vec![unlisted("deep", 5), unlisted("other", 2)];
+        root.items = 8;
+
+        let mut app = App::new(settings(), false);
+        app.root = base.clone();
+        app.cwd = base.clone();
+        app.tree = Some(root);
+        app.view = View::Overview;
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let scanned = base.clone();
+        app.session = Some(Session {
+            scanned_path: base.clone(),
+            kind: SessionKind::Root,
+            progress: Arc::new(Progress::default()),
+            cancel: Cancel::new(),
+            handle: Some(landing(
+                std::thread::spawn(move || {
+                    let _ = wait.recv();
+                    Ok(DiskEntry::new(&scanned, EntryType::Directory))
+                }),
+                app.compare_for(SessionKind::Root),
+            )),
+            started: Instant::now(),
+            discard_on_finish: false,
+        });
+        (app, base, release)
+    }
+
+    #[test]
+    fn an_unlisted_folder_fills_in_before_the_root_scan_finishes() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("fill");
+        app.cwd = base.join("deep");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.current_entry().unwrap().children.is_empty() {
+            assert!(Instant::now() < deadline, "the focus scan never landed");
+            app.poll_scan();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let deep = app.current_entry().unwrap();
+        assert_eq!(deep.children[0].name(), "inner");
+        assert_eq!(deep.apparent_size, 1500);
+        // Two levels further down is listed too, without another wait.
+        let inner_b = app
+            .tree
+            .as_ref()
+            .unwrap()
+            .resolve(&base.join("deep/inner/b"));
+        assert_eq!(inner_b.unwrap().children[0].name(), "c.bin");
+        assert!(app.session.is_some(), "the root scan keeps going");
+
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A focus scan of `path` that stays running until the sender is dropped.
+    fn blocked_focus(path: PathBuf) -> (Focus, std::sync::mpsc::Sender<()>) {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let landed = path.clone();
+        let focus = Focus {
+            path,
+            cancel: Cancel::new(),
+            handle: std::thread::spawn(move || {
+                let _ = wait.recv();
+                Ok(DiskEntry::new(&landed, EntryType::Directory))
+            }),
+        };
+        (focus, release)
+    }
+
+    #[test]
+    fn opening_another_unlisted_folder_moves_the_focus_there() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("retarget");
+        let (focus, focus_release) = blocked_focus(base.join("deep"));
+        let first = focus.cancel.clone();
+        app.focus = Some(focus);
+
+        app.cwd = base.join("other");
+        app.poll_scan();
+
+        assert_eq!(app.focus.as_ref().unwrap().path, base.join("other"));
+        assert!(
+            first.is_cancelled(),
+            "the folder left behind stops scanning"
+        );
+
+        drop((release, focus_release));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_root_scan_that_lands_first_drops_the_focus_scan() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("lands");
+        app.cwd = base.join("deep");
+        let (focus, focus_release) = blocked_focus(base.join("deep"));
+        let token = focus.cancel.clone();
+        app.focus = Some(focus);
+
+        drop(release);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.session.is_some() {
+            assert!(Instant::now() < deadline, "the root scan never landed");
+            app.poll_scan();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(app.focus.is_none());
+        assert!(token.is_cancelled());
+        // The root scan's tree has no `deep`; nothing may graft it back.
+        drop(focus_release);
+        app.poll_scan();
+        assert!(
+            app.tree
+                .as_ref()
+                .unwrap()
+                .resolve(&base.join("deep"))
+                .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_folder_a_stopped_scan_never_reached_is_focus_scanned() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("stopped");
+        let tree = app.tree.as_mut().unwrap();
+        tree.children[1].items = 1;
+        tree.children[1].set_scan_state(ScanState::Cancelled);
+        tree.items = 7;
+        app.cwd = base.join("other");
+
+        app.poll_scan();
+
+        assert_eq!(app.focus.as_ref().unwrap().path, base.join("other"));
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn folders_whose_view_would_not_use_a_focus_scan_get_none() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("limits");
+        app.cwd = base.join("deep");
+
+        // At the --depth limit nothing below would be kept.
+        app.settings.scan_options.max_depth = Some(1);
+        app.poll_scan();
+        assert!(app.focus.is_none());
+
+        // The growth view lists the diff, not the tree a focus grafts into.
+        app.settings.scan_options.max_depth = None;
+        app.metric = Metric::Growth;
+        app.diff = Some(disko_core::diff::diff(
+            app.tree.as_ref().unwrap(),
+            app.tree.as_ref().unwrap(),
+            SizeKind::Allocated,
+            0,
+            0,
+            0,
+        ));
+        app.poll_scan();
+        assert!(app.focus.is_none());
+
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_landing_focus_scan_keeps_the_cursor_on_the_same_folder() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("cursor");
+        // `other` outranks the unlisted `deep` (0 bytes) until `deep` is
+        // counted; one byte, so any real allocation of `deep` beats it.
+        app.tree.as_mut().unwrap().children[1].allocated_size = 1;
+        let (_, cancel, handle) = scan::scan_in_background_prioritized(
+            base.join("deep"),
+            base.clone(),
+            ScanOptions::default(),
+            scan::MountBoundaries::default(),
+        );
+        app.focus = Some(Focus {
+            path: base.join("deep"),
+            cancel,
+            handle,
+        });
+        app.selection = 1;
+        assert_eq!(app.selected_row().unwrap().path, Some(base.join("deep")));
+
+        land_focus(&mut app);
+
+        assert_eq!(app.selection, 0, "deep now outranks other");
+        assert_eq!(app.selected_row().unwrap().path, Some(base.join("deep")));
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Poll until the focus scan has landed.
+    fn land_focus(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.focus.is_some() {
+            assert!(Instant::now() < deadline, "the focus scan never landed");
+            app.poll_scan();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// `deep` as a pruned snapshot listed it, holding `entries` as children,
+    /// with a real scan of `deep` running as the focus.
+    fn focus_landing_on(app: &mut App, base: &Path, entries: Vec<DiskEntry>) {
+        let deep = &mut app.tree.as_mut().unwrap().children[0];
+        deep.items = 1 + entries.iter().map(|entry| entry.items).sum::<u64>();
+        deep.children = entries;
+        let (_, cancel, handle) = scan::scan_in_background_prioritized(
+            base.join("deep"),
+            base.to_path_buf(),
+            ScanOptions::default(),
+            scan::MountBoundaries::default(),
+        );
+        app.focus = Some(Focus {
+            path: base.join("deep"),
+            cancel,
+            handle,
+        });
+    }
+
+    #[test]
+    fn opening_a_subfolder_stops_the_parent_folder_scan() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("chain");
+        // A snapshot-style `deep` that lists `inner` but not everything in it,
+        // and an `inner` that lists nothing.
+        let mut inner = DiskEntry::new("inner", EntryType::Directory);
+        inner.items = 4;
+        app.tree.as_mut().unwrap().children[0].children = vec![inner];
+        let (focus, focus_release) = blocked_focus(base.join("deep"));
+        let parent = focus.cancel.clone();
+        app.focus = Some(focus);
+
+        app.cwd = base.join("deep/inner");
+        app.poll_scan();
+
+        // Left running, the parent's walk would be served first by the pool.
+        assert!(parent.is_cancelled());
+        assert_eq!(app.focus.as_ref().unwrap().path, base.join("deep/inner"));
+
+        drop((release, focus_release));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_folder_the_fresh_count_no_longer_has_returns_to_its_parent() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("climb");
+        // The snapshot listed `deep/gone/{x,y}`; the disk no longer has
+        // `gone`. The fresh count of `deep` has `inner` and a small file.
+        std::fs::write(base.join("deep/extra.bin"), b"x").unwrap();
+        let mut gone = DiskEntry::new("gone", EntryType::Directory);
+        gone.children = vec![
+            DiskEntry::new("x", EntryType::Directory),
+            DiskEntry::new("y", EntryType::Directory),
+        ];
+        gone.items = 3;
+        focus_landing_on(&mut app, &base, vec![gone]);
+        app.cwd = base.join("deep/gone");
+        app.selection = 1;
+        assert!(app.selected_row().unwrap().path.is_some());
+        // A finished search is open there, and `top = 1` folds `deep`'s file
+        // into "Other" — the row an old index of 1 would land on.
+        app.search = Some(String::new());
+        app.settings.top = 1;
+
+        land_focus(&mut app);
+
+        assert_eq!(app.cwd, base.join("deep"));
+        assert_eq!(app.selection, 0, "not the old index, nor an Other row");
+        assert!(app.search.is_none(), "a search for the folder left behind");
+        assert_eq!(
+            app.selected_row().unwrap().path,
+            Some(base.join("deep/inner"))
+        );
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_search_being_typed_survives_a_climb() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("typing");
+        focus_landing_on(
+            &mut app,
+            &base,
+            vec![{
+                let mut gone = DiskEntry::new("gone", EntryType::Directory);
+                gone.items = 1;
+                gone
+            }],
+        );
+        app.cwd = base.join("deep/gone");
+        app.search = Some("i".into());
+        app.search_active = true;
+
+        land_focus(&mut app);
+
+        assert_eq!(app.cwd, base.join("deep"));
+        // The next keys are still meant for the search box, not as commands.
+        assert!(app.search_active);
+        assert_eq!(app.search.as_deref(), Some("i"));
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_stopped_scan_that_never_reached_the_folder_returns_to_one_it_did() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("stopped-root");
+        drop(release);
+        // On screen: `deep/inner`, filled ahead by a focus scan. The root scan
+        // lands (as after `z`) the way a real stop leaves it: the root lists
+        // `deep`, but `deep` was never walked.
+        let mut deep = DiskEntry::new("deep", EntryType::Directory);
+        deep.set_scan_state(ScanState::Cancelled);
+        let mut stopped = DiskEntry::new(&base, EntryType::Directory);
+        stopped.absorb(&deep);
+        stopped.children = vec![deep];
+        stopped.set_scan_state(ScanState::Cancelled);
+        hand_over(&mut app, std::thread::spawn(move || Ok(stopped)));
+        app.cwd = base.join("deep/inner");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.session.is_some() {
+            assert!(Instant::now() < deadline, "the root scan never landed");
+            app.poll_scan();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(app.cwd, base.join("deep"), "the nearest folder it listed");
+        // That folder was never walked: say so rather than "empty".
+        assert_eq!(app.cwd_listing(), Listing::Short);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_folder_counted_but_not_listed_does_not_claim_to_be_empty() {
+        let mut app = app_with_tree();
+        // `small` holds two entries the tree counted but did not keep, as a
+        // focus scan's 5-level cut leaves it once no scan is running.
+        app.tree.as_mut().unwrap().children[1].items = 3;
+        app.cwd = PathBuf::from("/disko-test-root/small");
+
+        assert_eq!(app.cwd_listing(), Listing::Short);
+        app.cwd = PathBuf::from("/disko-test-root/big/inner");
+        assert_eq!(app.cwd_listing(), Listing::Complete, "really empty");
+    }
+
+    #[test]
+    fn the_unlisted_remainder_is_what_the_rows_do_not_add_up_to() {
+        let mut app = app_with_tree();
+        // `big` (700) lists `inner` (500, 1 entry) but counted 3 more entries.
+        app.tree.as_mut().unwrap().children[0].items = 5;
+        app.cwd = PathBuf::from("/disko-test-root/big");
+        assert_eq!(app.cwd_unlisted(), Some((3, 200)));
+
+        // The growth view lists the diff, not the tree: nothing to add there.
+        app.metric = Metric::Growth;
+        app.diff = Some(disko_core::diff::diff(
+            app.tree.as_ref().unwrap(),
+            app.tree.as_ref().unwrap(),
+            SizeKind::Allocated,
+            0,
+            0,
+            0,
+        ));
+        assert_eq!(app.cwd_unlisted(), None);
+
+        // A complete folder has nothing unlisted.
+        app.metric = Metric::Size;
+        app.cwd = PathBuf::from("/disko-test-root");
+        assert_eq!(app.cwd_unlisted(), None);
+    }
+
+    #[test]
+    fn the_unlisted_line_keeps_its_action_in_a_narrow_legend() {
+        let mut app = app_with_tree();
+        // Millions of entries and terabytes unlisted: the widest numbers.
+        let big = &mut app.tree.as_mut().unwrap().children[0];
+        big.items = 9_999_999;
+        big.allocated_size = 999_900_000_000_000;
+        app.cwd = PathBuf::from("/disko-test-root/big");
+
+        let line = crate::tui::overview::unlisted_line(&app, 0, 34).unwrap();
+        assert!(crate::tui::text::width(&line) <= 34, "{line}");
+        assert!(line.ends_with("— press r"), "{line}");
+        let wide = crate::tui::overview::unlisted_line(&app, 0, 100).unwrap();
+        assert!(wide.contains("9,999,997 more"), "{wide}");
+    }
+
+    #[test]
+    fn a_short_folder_outside_a_running_rescan_does_not_offer_r() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("r-busy");
+        // `r` on `deep` is running; `other` is short and outside it.
+        let session = app.session.as_mut().unwrap();
+        session.kind = SessionKind::Subtree;
+        session.scanned_path = base.join("deep");
+        app.cwd = base.join("other");
+
+        let message = crate::tui::overview::no_rows_message(&app, 0);
+
+        assert_eq!(message, "not fully counted — r after scan");
+        // The explorer legend is 34 columns at most.
+        assert!(crate::tui::text::width(&message) <= 34);
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_folder_counted_afresh_drops_the_snapshot_age() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("fresh-label");
+        app.provisional = Some(1);
+        app.cwd = base.join("deep");
+        app.poll_scan();
+        land_focus(&mut app);
+
+        assert_eq!(app.provisional_for_cwd(), None, "`deep` was just counted");
+        app.cwd = base.clone();
+        assert_eq!(
+            app.provisional_for_cwd(),
+            Some(1),
+            "the rest is the snapshot"
+        );
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_swapped_for_a_symlink_is_not_grafted_in() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("swapped");
+        std::os::unix::fs::symlink(base.join("other"), base.join("link")).unwrap();
+        let mut link = DiskEntry::new("link", EntryType::Directory);
+        link.items = 2;
+        let tree = app.tree.as_mut().unwrap();
+        tree.children.push(link);
+        tree.items += 2;
+        app.cwd = base.join("link");
+        app.poll_scan();
+        assert!(app.focus.is_some());
+        land_focus(&mut app);
+
+        let link = app
+            .tree
+            .as_ref()
+            .unwrap()
+            .resolve(&base.join("link"))
+            .unwrap();
+        assert!(link.children.is_empty(), "`other` grafted in under `link`");
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_folder_replaced_by_a_file_returns_to_its_parent() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("became-file");
+        app.cwd = base.join("deep");
+        let path = base.join("deep");
+        app.focus = Some(Focus {
+            path: path.clone(),
+            cancel: Cancel::new(),
+            handle: std::thread::spawn(move || Ok(DiskEntry::new(&path, EntryType::File))),
+        });
+
+        land_focus(&mut app);
+
+        assert_eq!(app.cwd, base);
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_growth_view_stays_on_a_removed_folder_after_a_graft() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("growth-climb");
+        let gone = DiskEntry::new("gone", EntryType::Directory);
+        app.tree.as_mut().unwrap().children[0].children = vec![gone];
+        app.metric = Metric::Growth;
+        app.diff = Some(disko_core::diff::diff(
+            app.tree.as_ref().unwrap(),
+            app.tree.as_ref().unwrap(),
+            SizeKind::Allocated,
+            0,
+            0,
+            0,
+        ));
+        app.cwd = base.join("deep/gone");
+        let (focus, focus_release) = blocked_focus(base.join("deep"));
+        app.focus = Some(focus);
+
+        drop(focus_release);
+        land_focus(&mut app);
+
+        // Growth lists from the diff, which still has `gone`.
+        assert_eq!(app.cwd, base.join("deep/gone"));
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_r_rescan_above_the_folder_also_scans_it_first() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("subtree");
+        app.session.as_mut().unwrap().kind = SessionKind::Subtree;
+        app.cwd = base.join("deep");
+
+        app.poll_scan();
+
+        assert_eq!(app.focus.as_ref().unwrap().path, base.join("deep"));
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn going_further_down_than_a_focus_keeps_stops_it() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("too-deep");
+        let (focus, focus_release) = blocked_focus(base.join("deep"));
+        let token = focus.cancel.clone();
+        app.focus = Some(focus);
+
+        // Within reach: the focus result will list this folder.
+        app.cwd = base.join("deep/1/2/3/4");
+        app.poll_scan();
+        assert!(!token.is_cancelled());
+
+        // One level past what it keeps: its result would empty this folder.
+        app.cwd = base.join("deep/1/2/3/4/5");
+        app.poll_scan();
+        assert!(token.is_cancelled());
+
+        drop((release, focus_release));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_focus_that_finished_as_the_user_went_past_it_is_not_grafted() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("past-reach");
+        let (focus, focus_release) = blocked_focus(base.join("deep"));
+        drop(focus_release);
+        while !focus.handle.is_finished() {
+            std::thread::yield_now();
+        }
+        app.focus = Some(focus);
+        // In one burst of keys the user went past what it keeps.
+        app.cwd = base.join("deep/1/2/3/4/5");
+
+        app.poll_scan();
+
+        assert!(app.focus.is_none());
+        let deep = app
+            .tree
+            .as_ref()
+            .unwrap()
+            .resolve(&base.join("deep"))
+            .unwrap();
+        assert_eq!(deep.items, 5, "the stale result did not replace `deep`");
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_stopped_rescan_says_which_folders_it_did_change() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("stopped-r");
+        app.session.as_mut().unwrap().kind = SessionKind::Subtree;
+        app.cwd = base.join("deep");
+        app.poll_scan();
+        land_focus(&mut app);
+        // A comparison was showing before the rescan.
+        app.diff = Some(disko_core::diff::diff(
+            app.tree.as_ref().unwrap(),
+            app.tree.as_ref().unwrap(),
+            SizeKind::Allocated,
+            0,
+            0,
+            0,
+        ));
+
+        app.cancel_background_scan();
+        drop(release);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.session.is_some() {
+            assert!(Instant::now() < deadline, "the rescan never ended");
+            app.poll_scan();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("except folders opened meanwhile"),
+            "{status}"
+        );
+        // The tree is no longer the last scan's: no stale comparison over it.
+        assert!(app.diff.is_none());
+        assert!(app.changed_since_scan);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn no_rows_messages_fit_their_cases() {
+        let mut app = app_with_tree();
+        // The run's own root at `--depth 0`: not "run disko here" again.
+        app.settings.scan_options.max_depth = Some(0);
+        // Counted three entries, kept none.
+        let root = app.tree.as_mut().unwrap();
+        root.children.clear();
+        root.items = 4;
+        assert_eq!(
+            crate::tui::overview::no_rows_message(&app, 0),
+            "beyond --depth"
+        );
+
+        // A search just opened, nothing typed: about the folder, not the query.
+        app.settings.scan_options.max_depth = None;
+        app.search = Some(String::new());
+        assert_eq!(
+            crate::tui::overview::no_rows_message(&app, 0),
+            "not fully counted — press r"
+        );
+
+        // A typed search in a folder not fully listed: a match may still come.
+        app.search = Some("zz".into());
+        assert_eq!(
+            crate::tui::overview::no_rows_message(&app, 0),
+            "nothing listed matches yet"
+        );
+    }
+
+    #[test]
+    fn a_failed_rescan_keeps_its_focus_grafts_as_a_change() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("failed-r");
+        app.session.as_mut().unwrap().kind = SessionKind::Subtree;
+        app.cwd = base.join("deep");
+        app.poll_scan();
+        land_focus(&mut app);
+        app.diff = Some(disko_core::diff::diff(
+            app.tree.as_ref().unwrap(),
+            app.tree.as_ref().unwrap(),
+            SizeKind::Allocated,
+            0,
+            0,
+            0,
+        ));
+        // The `r` rescan itself fails (the folder went away, say).
+        drop(release);
+        hand_over(
+            &mut app,
+            std::thread::spawn(|| Err(anyhow::anyhow!("gone"))),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.session.is_some() {
+            assert!(Instant::now() < deadline, "the rescan never ended");
+            app.poll_scan();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(app.diff.is_none(), "no stale comparison over fresh folders");
+        assert!(app.changed_since_scan);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_folder_pushed_into_other_keeps_the_cursor_on_other() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("other-row");
+        app.settings.top = 1;
+        // `deep` leads on stale numbers, then counts in far smaller than `other`.
+        let tree = app.tree.as_mut().unwrap();
+        tree.children[1].allocated_size = 100_000_000;
+        tree.children[0].allocated_size = 900_000_000;
+        let (_, cancel, handle) = scan::scan_in_background_prioritized(
+            base.join("deep"),
+            base.clone(),
+            ScanOptions::default(),
+            scan::MountBoundaries::default(),
+        );
+        app.focus = Some(Focus {
+            path: base.join("deep"),
+            cancel,
+            handle,
+        });
+        app.selection = 0;
+        assert_eq!(app.selected_row().unwrap().path, Some(base.join("deep")));
+
+        land_focus(&mut app);
+
+        let selected = app.selected_row().unwrap();
+        assert_eq!(selected.path, None, "the cursor is on {:?}", selected.name);
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_entry_gone_from_disk_does_not_send_the_cursor_to_other() {
+        let (mut app, base, release) = browsing_ahead_of_a_root_scan("gone-entry");
+        // The snapshot listed `deep/stale` first; the disk no longer has it.
+        std::fs::write(base.join("deep/extra.bin"), b"x").unwrap();
+        let mut stale = DiskEntry::new("stale", EntryType::Directory);
+        stale.allocated_size = 900_000_000;
+        focus_landing_on(&mut app, &base, vec![stale]);
+        app.cwd = base.join("deep");
+        app.selection = 0;
+        assert_eq!(
+            app.selected_row().unwrap().path,
+            Some(base.join("deep/stale"))
+        );
+        app.settings.top = 1;
+
+        land_focus(&mut app);
+
+        // Rows are now `inner` and "Other" (holding `extra.bin`, not `stale`).
+        assert_eq!(
+            app.selected_row().unwrap().path,
+            Some(base.join("deep/inner"))
+        );
+        drop(release);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_listing_is_short_when_it_counts_less_than_it_holds() {
+        let dir = |items, children: Vec<DiskEntry>| {
+            let mut entry = DiskEntry::new("d", EntryType::Directory);
+            entry.items = items;
+            entry.children = children;
+            entry
+        };
+        let file = || DiskEntry::new("f", EntryType::File);
+
+        assert!(!lists_less_than_it_holds(&dir(3, vec![file(), file()])));
+        assert!(lists_less_than_it_holds(&dir(3, vec![])), "stub");
+        assert!(
+            lists_less_than_it_holds(&dir(4, vec![file()])),
+            "pruned snapshot"
+        );
+        assert!(
+            !lists_less_than_it_holds(&dir(1, vec![])),
+            "empty or denied"
+        );
+        let mut stopped = dir(1, vec![]);
+        stopped.set_scan_state(ScanState::Cancelled);
+        assert!(lists_less_than_it_holds(&stopped), "never reached");
+        let mut cut_short = dir(2, vec![file()]);
+        cut_short.set_scan_state(ScanState::Cancelled);
+        assert!(
+            lists_less_than_it_holds(&cut_short),
+            "stopped while listing"
+        );
+        let mut big_file = file();
+        big_file.items = 5;
+        assert!(!lists_less_than_it_holds(&big_file));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refresh_whose_root_now_points_elsewhere_is_refused() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
+        // The scan root itself was replaced by a symlink since the last
+        // scan, the same way `a_folder_replaced_by_a_symlink_since_the_scan_refuses_the_rescan`
+        // covers a folder under it — `refresh` (`R`, or the watch tick) must
+        // refuse the same way instead of grafting a stub with no session to
+        // ever fill it back in.
+        let base =
+            std::env::temp_dir().join(format!("disko-refresh-symlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let original = base.join("original");
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir_all(&original).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::remove_dir(&original).unwrap();
+        symlink(&elsewhere, &original).unwrap();
+
+        let mut app = app_with_tree();
+        app.root = original.clone();
+        app.cwd = original.clone();
+
+        app.refresh();
+
+        assert!(
+            app.session.is_none(),
+            "a root that no longer resolves to itself must not start a scan"
+        );
+        assert!(
+            app.tree.is_some(),
+            "the tree on screen must survive the refusal untouched"
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("points somewhere else")),
+            "status was: {:?}",
+            app.status
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn tick_watch_does_not_refresh_outside_a_browsing_view() {
+        let mut app = app_with_tree();
+        app.watch = Some(Watch::new(60));
+        app.watch.as_mut().unwrap().last_scan = Instant::now() - Duration::from_secs(120);
+        app.view = View::Picker;
+
+        app.tick_watch();
+
+        assert!(
+            app.session.is_none(),
+            "the Picker has no tree on screen for a refresh to update"
+        );
+    }
+
+    #[test]
+    fn a_failed_refresh_makes_the_watch_wait_a_full_interval_before_retrying() {
+        let mut app = app_with_tree();
+        app.watch = Some(Watch::new(60));
+        // Backdated past due, so only the failure arm moving the clock makes
+        // the final assertion hold.
+        app.watch.as_mut().unwrap().last_scan = Instant::now() - Duration::from_secs(120);
+        app.rescan_root();
+        assert!(app.session.is_some());
+
+        let handle: JoinHandle<Result<DiskEntry>> =
+            std::thread::spawn(|| Err(anyhow::anyhow!("mount vanished")));
+        while !handle.is_finished() {
+            std::thread::yield_now();
+        }
+        hand_over(&mut app, handle);
+
+        app.poll_scan();
+
+        assert!(app.session.is_none());
+        assert!(
+            !app.watch.as_ref().unwrap().is_due(),
+            "a failed scan must move the clock the same way a finished one does, \
+             or tick_watch retries on the very next frame"
+        );
+    }
+
+    #[test]
+    fn beginning_a_fresh_scan_cancels_the_session_it_replaces() {
+        let mut app = app_with_tree();
+        let old_root = app.root.clone();
+        app.from_picker = true;
+
+        let handle: JoinHandle<Result<DiskEntry>> = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(DiskEntry::new(
+                PathBuf::from("/disko-test-root"),
+                EntryType::Directory,
+            ))
+        });
+        let old_cancel = Cancel::new();
+        app.session = Some(Session {
+            scanned_path: old_root,
+            kind: SessionKind::Root,
+            progress: Arc::new(Progress::default()),
+            cancel: old_cancel.clone(),
+            handle: Some(landing(handle, app.compare_for(SessionKind::Root))),
+            started: Instant::now(),
+            discard_on_finish: false,
+        });
+
+        app.start_scan(Path::new("/disko-other-root"));
+
+        assert!(
+            old_cancel.is_cancelled(),
+            "the replaced session's cancel token must be set, not just dropped"
+        );
+        assert_eq!(app.root, PathBuf::from("/disko-other-root"));
+        app.cancel_scan();
+    }
+
+    #[test]
+    fn growth_in_watch_mode_waits_for_the_next_rescan_once_a_baseline_exists() {
+        let mut app = app_with_tree();
+        app.watch = Some(Watch::new(60));
+        app.toggle_metric();
+        assert_eq!(app.status.as_deref(), Some("waiting for the first rescan"));
+
+        app.watch.as_mut().unwrap().baseline = Some(Arc::new(
+            disko_core::history::prune_for_storage(app.tree.as_ref().unwrap()),
+        ));
+        app.toggle_metric();
+        assert_eq!(app.status.as_deref(), Some("waiting for the next rescan"));
+    }
+
+    #[test]
+    fn a_fresh_scan_to_a_new_root_resets_the_watch_baseline() {
+        let mut app = app_with_tree();
+        app.watch = Some(Watch::new(60));
+        // The baseline a completed scan of the old root would have left
+        // behind for watch mode to diff future scans against.
+        app.watch.as_mut().unwrap().baseline = Some(Arc::new(
+            disko_core::history::prune_for_storage(app.tree.as_ref().unwrap()),
+        ));
+        app.watch.as_mut().unwrap().rounds = 3;
+        let baseline = app.watch.as_ref().unwrap().baseline.clone().unwrap();
+        let now = disko_core::history::now();
+        app.diff = Some(disko_core::diff::diff(
+            &baseline,
+            app.tree.as_ref().unwrap(),
+            app.settings.size_kind,
+            now,
+            now,
+            disko_core::history::storage_floor(&baseline),
+        ));
+
+        // Reachable without the Picker: a watched root's session can fail
+        // (`poll_scan`'s `Ok(Err(_))` arm) and drop the view to `Picker`
+        // without touching `watch`; picking a different filesystem from
+        // there reaches `begin(Fresh)` with a new root while `watch` is
+        // still set from the old one.
+        app.start_scan(Path::new("/disko-other-root"));
+
+        assert!(
+            app.watch.as_ref().unwrap().baseline.is_none(),
+            "a new root must not be diffed against the old root's baseline"
+        );
+        assert!(
+            app.diff.is_none(),
+            "the old root's growth view must not survive a change of root"
+        );
+        assert_eq!(
+            app.watch.as_ref().unwrap().every,
+            60,
+            "the interval the user chose must survive a change of root"
+        );
+        app.cancel_scan();
     }
 }

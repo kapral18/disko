@@ -246,7 +246,7 @@ fn compare(
         after: after_size,
         delta,
         kind: classify(before.is_some(), after.is_some(), delta),
-        modified: after.map(|entry| entry.modified).unwrap_or(0),
+        modified: after.map(DiskEntry::modified).unwrap_or(0),
         before_is_bound: before.is_none() && floor > 0,
     };
 

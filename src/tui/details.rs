@@ -15,7 +15,7 @@ use crate::tui::{text, theme};
 /// How wide the panel would like to be, before the terminal has its say.
 const PANEL_WIDTH: u16 = 66;
 
-pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
+pub fn draw(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     let mut rows: Vec<(String, String)> = Vec::new();
     let unit = app.settings.unit;
 
@@ -61,18 +61,34 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         rows.push((String::new(), String::new()));
         rows.push(("Path".into(), model::display_path(path)));
 
-        if let Some(entry) = app.tree.as_ref().and_then(|tree| tree.resolve(path)) {
+        let entry = app.tree.as_ref().and_then(|tree| tree.resolve(path));
+        if let Some(entry) = entry {
             rows.push((
                 "Current size".into(),
                 format(entry.size(app.settings.size_kind), unit),
             ));
             rows.push(("Items".into(), entry.items.to_string()));
-            if entry.modified > 0 {
+            if entry.modified() > 0 {
                 rows.push((
                     "Last used".into(),
-                    crate::timefmt::ago(disko_core::history::now().saturating_sub(entry.modified)),
+                    crate::timefmt::ago(
+                        disko_core::history::now().saturating_sub(entry.modified()),
+                    ),
                 ));
             }
+        } else if let Some(progress) = app.progress() {
+            rows.push((
+                "Status".into(),
+                format!("{} scanning in background…", theme::spinner(tick)),
+            ));
+            rows.push((
+                "Counted".into(),
+                format!(
+                    "{} items · {}",
+                    progress.entries(),
+                    format(progress.bytes(), unit)
+                ),
+            ));
         }
 
         if let Some(diff) = &app.diff
@@ -136,14 +152,20 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         ])
     }));
 
+    let title = if let Some(progress) = app.progress() {
+        format!(
+            " Details · {} scanning ({} items) — d to close ",
+            theme::spinner(tick),
+            progress.entries()
+        )
+    } else if app.outcomes.is_empty() {
+        " Details — d to close ".to_string()
+    } else {
+        " Details — last deletion — d to close ".to_string()
+    };
+
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(
-            if app.outcomes.is_empty() {
-                " Details — d to close "
-            } else {
-                " Details — last deletion — d to close "
-            },
-        )),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         popup,
     );
 }

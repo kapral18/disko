@@ -35,4 +35,4 @@ pub use history::{Snapshot, Store};
 pub use mounts::{Filesystem, Inodes};
 pub use scan::{Cancel, Progress, ScanOptions};
 pub use size::{SizeKind, Unit};
-pub use tree::{DiskEntry, EntryType, ScanState};
+pub use tree::{DiskEntry, EntryType, PublicTree, ScanState};

@@ -47,10 +47,15 @@ anyhow.workspace = true
 serde.workspace = true
 ratatui = "0.29"
 crossterm = "0.28"
+dirs = "6.0.0"
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 unicode-width = "0.2"
 jiff = "0.2.35"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+rustix = { version = "0.38.44", features = ["fs"] }
 
 [package.metadata.release]
 # This hook belongs only to the root package. A workspace-level hook would run
