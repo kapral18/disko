@@ -145,7 +145,7 @@ fn is_pseudo(fs_type: &str, mount_point: &Path) -> bool {
     }
     let mount = mount_point.to_string_lossy();
     // macOS synthesises a pile of mounts under /System/Volumes; only the Data
-    // volume is somewhere a user actually stores things.
+    // volume holds user files. It is real; `list` folds it into the `/` row.
     if mount.starts_with("/System/Volumes/") && mount != "/System/Volumes/Data" {
         return true;
     }
@@ -155,8 +155,13 @@ fn is_pseudo(fs_type: &str, mount_point: &Path) -> bool {
 }
 
 /// Every mounted filesystem, real ones first and largest first within that.
+///
+/// This is the list a person picks from, so macOS's system/Data split is
+/// folded into one "Macintosh HD" row here; `for_path` keeps the halves apart.
 pub fn list(include_pseudo: bool) -> Vec<Filesystem> {
     let mut filesystems = collect();
+    #[cfg(target_os = "macos")]
+    fold_data_volume(&mut filesystems);
     if !include_pseudo {
         filesystems.retain(|fs| !fs.pseudo && fs.total > 0);
     }
@@ -169,10 +174,29 @@ pub fn list(include_pseudo: bool) -> Vec<Filesystem> {
     filesystems
 }
 
-/// The filesystem `path` lives on: the mount point that is its longest prefix.
+/// The actual filesystem `path` lives on, with that mount's own metadata.
+///
+/// On macOS the kernel says which mount holds the path (firmlinks make
+/// `/Users` live on `/System/Volumes/Data`, not on `/`); a mount sysinfo
+/// leaves out is described from `statfs`. Elsewhere, or when the kernel cannot
+/// be asked, the longest mount-point prefix answers.
 pub fn for_path(path: &Path) -> Option<Filesystem> {
     let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    list(true)
+    let filesystems = collect();
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if let Some(raw) = raw_statfs(&absolute) {
+        let mount_point = c_path(&raw.f_mntonname);
+        return Some(
+            match filesystems
+                .iter()
+                .position(|fs| fs.mount_point == mount_point)
+            {
+                Some(index) => filesystems.into_iter().nth(index)?,
+                None => unlisted_filesystem(&raw),
+            },
+        );
+    }
+    filesystems
         .into_iter()
         .filter(|fs| absolute.starts_with(&fs.mount_point))
         .max_by_key(|fs| fs.mount_point.as_os_str().len())
@@ -333,6 +357,69 @@ fn collect() -> Vec<Filesystem> {
         .collect()
 }
 
+/// `MNT_REMOVABLE` from `<sys/mount.h>`; the libc crate does not export it.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const MNT_REMOVABLE: u32 = 0x0000_0200;
+
+/// A row for a mount sysinfo leaves out (it lists only browsable volumes, so
+/// not devfs or the hidden APFS volumes), built from the `statfs` that found it.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn unlisted_filesystem(raw: &libc::statfs) -> Filesystem {
+    let mount_point = c_path(&raw.f_mntonname);
+    let fs_type = c_text(&raw.f_fstypename);
+    let stat = fs_stat_from(raw);
+    let device = stat.device.unwrap_or_else(|| fs_type.clone());
+    Filesystem {
+        name: friendly_name(None, &device, &mount_point),
+        device,
+        pseudo: is_pseudo(&fs_type, &mount_point),
+        fs_type,
+        total: stat.total,
+        used: stat.used,
+        available: stat.available,
+        read_only: stat.read_only,
+        removable: raw.f_flags & MNT_REMOVABLE != 0,
+        kind: "Unknown".to_string(),
+        inodes: stat.inodes,
+        mount_point,
+    }
+}
+
+/// macOS splits one "Macintosh HD" into a sealed, read-only system snapshot
+/// at `/` and the Data volume where everything a user writes lives, with
+/// firmlinks making the two look like a single tree under `/`. Present them
+/// that way: one row, mounted at `/`, counting inodes from both halves and
+/// writable because the half you can write to is.
+#[cfg(target_os = "macos")]
+fn fold_data_volume(filesystems: &mut Vec<Filesystem>) {
+    let Some(data_index) = filesystems
+        .iter()
+        .position(|fs| fs.mount_point == Path::new("/System/Volumes/Data"))
+    else {
+        return;
+    };
+    let data = filesystems.remove(data_index);
+    let Some(root) = filesystems
+        .iter_mut()
+        .find(|fs| fs.mount_point == Path::new("/"))
+    else {
+        filesystems.insert(data_index, data);
+        return;
+    };
+    root.read_only = data.read_only;
+    root.inodes = match (root.inodes.take(), data.inodes) {
+        (Some(system), Some(data)) => {
+            let used = system.used + data.used;
+            Some(Inodes {
+                total: used + data.free,
+                used,
+                free: data.free,
+            })
+        }
+        (system, data) => data.or(system),
+    };
+}
+
 #[cfg(target_os = "linux")]
 struct MountRow {
     device: String,
@@ -449,16 +536,25 @@ fn os_stat(mount_point: &Path) -> Option<FsStat> {
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn os_stat(mount_point: &Path) -> Option<FsStat> {
-    use std::ffi::{CStr, CString};
+    raw_statfs(mount_point).map(|raw| fs_stat_from(&raw))
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn raw_statfs(path: &Path) -> Option<libc::statfs> {
+    use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let path = CString::new(mount_point.as_os_str().as_bytes()).ok()?;
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut raw: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: as above — valid path, zeroed destination of the right size.
     if unsafe { libc::statfs(path.as_ptr(), &mut raw) } != 0 {
         return None;
     }
+    Some(raw)
+}
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn fs_stat_from(raw: &libc::statfs) -> FsStat {
     let unit = raw.f_bsize as u64;
     let total = raw.f_blocks * unit;
     let free = raw.f_bfree * unit;
@@ -471,19 +567,42 @@ fn os_stat(mount_point: &Path) -> Option<FsStat> {
         used: inodes_total.saturating_sub(raw.f_ffree),
     });
 
-    // SAFETY: f_mntfromname is a NUL-terminated C string inside the struct.
-    let device = unsafe { CStr::from_ptr(raw.f_mntfromname.as_ptr()) }
-        .to_string_lossy()
-        .to_string();
-
-    Some(FsStat {
+    let device = c_text(&raw.f_mntfromname);
+    FsStat {
         total,
         used: total.saturating_sub(free),
         available,
         read_only: raw.f_flags & libc::MNT_RDONLY as u32 != 0,
         device: (!device.is_empty()).then_some(device),
         inodes,
-    })
+    }
+}
+
+/// The bytes of a NUL-terminated name field inside a `statfs`, bounded by
+/// the array even if the terminator is missing.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn c_bytes(field: &[libc::c_char]) -> &[u8] {
+    // SAFETY: `c_char` and `u8` have the same size and alignment, and the
+    // slice covers exactly the array's memory.
+    let bytes = unsafe { std::slice::from_raw_parts(field.as_ptr().cast::<u8>(), field.len()) };
+    bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .map_or(bytes, |end| &bytes[..end])
+}
+
+/// A name field for display (device, filesystem type).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn c_text(field: &[libc::c_char]) -> String {
+    String::from_utf8_lossy(c_bytes(field)).into_owned()
+}
+
+/// A path field, byte for byte: a mount point need not be valid UTF-8, and
+/// it must still match the row sysinfo reported for it.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn c_path(field: &[libc::c_char]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(c_bytes(field)))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
@@ -506,6 +625,73 @@ mod tests {
         assert!(!is_remote("ext4"));
         assert!(!is_remote("apfs"));
         assert!(!is_remote("xfs"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_data_volume_folds_into_the_root_row() {
+        let volume = |mount_point: &str, read_only: bool, inodes: Option<Inodes>| Filesystem {
+            name: "Macintosh HD".into(),
+            mount_point: PathBuf::from(mount_point),
+            device: String::new(),
+            fs_type: "apfs".into(),
+            total: 100,
+            used: 70,
+            available: 30,
+            read_only,
+            removable: false,
+            kind: "SSD".into(),
+            pseudo: false,
+            inodes,
+        };
+        let inodes = |used, free| {
+            Some(Inodes {
+                total: used + free,
+                used,
+                free,
+            })
+        };
+        let mut filesystems = vec![
+            volume("/System/Volumes/Data", false, inodes(34_000, 170_000)),
+            volume("/", true, inodes(450, 9_000)),
+            volume("/Volumes/backup", false, inodes(5, 5)),
+        ];
+
+        fold_data_volume(&mut filesystems);
+
+        assert_eq!(filesystems.len(), 2);
+        let root = &filesystems[0];
+        assert_eq!(root.mount_point, Path::new("/"));
+        assert!(!root.read_only, "the half a user writes to is writable");
+        let merged = root.inodes.as_ref().unwrap();
+        assert_eq!(
+            (merged.used, merged.free, merged.total),
+            (34_450, 170_000, 204_450)
+        );
+        assert_eq!(filesystems[1].mount_point, Path::new("/Volumes/backup"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_data_volume_without_a_root_row_is_left_alone() {
+        let mut filesystems = vec![Filesystem {
+            name: "Macintosh HD".into(),
+            mount_point: PathBuf::from("/System/Volumes/Data"),
+            device: String::new(),
+            fs_type: "apfs".into(),
+            total: 1,
+            used: 0,
+            available: 1,
+            read_only: false,
+            removable: false,
+            kind: "SSD".into(),
+            pseudo: false,
+            inodes: None,
+        }];
+
+        fold_data_volume(&mut filesystems);
+
+        assert_eq!(filesystems.len(), 1);
     }
 
     #[test]
@@ -561,6 +747,48 @@ mod tests {
         let root = for_path(Path::new("/")).expect("every system has a root filesystem");
         assert!(root.total > 0);
         assert!(root.used_fraction() >= 0.0 && root.used_fraction() <= 1.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_firmlinked_path_reports_the_data_volume_not_the_sealed_root() {
+        let users = for_path(Path::new("/Users")).unwrap();
+        let system = for_path(Path::new("/System")).unwrap();
+
+        assert_eq!(users.mount_point, Path::new("/System/Volumes/Data"));
+        assert!(!users.read_only);
+        assert_eq!(system.mount_point, Path::new("/"));
+        assert!(system.read_only, "the sealed system volume is read-only");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_mount_sysinfo_leaves_out_is_still_reported_for_its_paths() {
+        let devfs = for_path(Path::new("/dev")).unwrap();
+
+        assert_eq!(devfs.mount_point, Path::new("/dev"));
+        assert_eq!(devfs.fs_type, "devfs");
+        assert!(devfs.pseudo);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_non_utf8_mount_point_keeps_its_exact_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let name: &[u8] = b"/Volumes/caf\xe9";
+        let mut raw: libc::statfs = unsafe { std::mem::zeroed() };
+        for (slot, byte) in raw.f_mntonname.iter_mut().zip(name) {
+            *slot = *byte as libc::c_char;
+        }
+        for (slot, byte) in raw.f_fstypename.iter_mut().zip(b"msdos") {
+            *slot = *byte as libc::c_char;
+        }
+
+        let fs = unlisted_filesystem(&raw);
+
+        assert_eq!(fs.mount_point.as_os_str().as_bytes(), name);
+        assert_eq!(fs.fs_type, "msdos");
     }
 
     #[test]
