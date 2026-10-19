@@ -136,6 +136,66 @@ pub fn remote_mount_points() -> Vec<PathBuf> {
         .collect()
 }
 
+/// The mount points a scan stops at: network mounts (only with
+/// `skip_remote`) and mounts that expose operating-system internals rather
+/// than user data.
+#[cfg(target_os = "linux")]
+pub(crate) fn scan_boundaries(skip_remote: bool) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let remote = if skip_remote {
+        remote_mount_points()
+    } else {
+        Vec::new()
+    };
+    (remote, pseudo_mount_points())
+}
+
+/// One listing serves both: on macOS it takes about 50 ms.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn scan_boundaries(skip_remote: bool) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut remote = Vec::new();
+    let mut pseudo = Vec::new();
+    for fs in list(true) {
+        if skip_remote && is_remote(&fs.fs_type) {
+            remote.push(fs.mount_point.clone());
+        }
+        if fs.pseudo {
+            pseudo.push(fs.mount_point);
+        }
+    }
+    (remote, pseudo)
+}
+
+#[cfg(target_os = "linux")]
+fn pseudo_mount_points() -> Vec<PathBuf> {
+    pseudo_mount_points_from_rows(read_proc_mounts())
+}
+
+#[cfg(target_os = "linux")]
+fn pseudo_mount_points_from_rows(rows: Vec<MountRow>) -> Vec<PathBuf> {
+    // `/proc/mounts` lists mounts in the order the kernel mounted them, so a
+    // later row at the same mount point is stacked on top of an earlier one
+    // and hides it — the classic case is an autofs placeholder that a real
+    // filesystem gets mounted over once something touches it. A path is only
+    // pseudo when its *topmost* row is; keep the last row seen per mount
+    // point rather than flagging the point pseudo because any row there ever
+    // was.
+    let mut topmost: std::collections::HashMap<PathBuf, bool> = std::collections::HashMap::new();
+    for MountRow {
+        device: _,
+        mount_point,
+        fs_type,
+        options: _,
+    } in rows
+    {
+        let pseudo = is_pseudo(&fs_type, &mount_point);
+        topmost.insert(mount_point, pseudo);
+    }
+    topmost
+        .into_iter()
+        .filter_map(|(mount_point, pseudo)| pseudo.then_some(mount_point))
+        .collect()
+}
+
 /// Mount points that exist for the OS's benefit, not the user's.
 const PSEUDO_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/run", "/snap", "/var/snap"];
 
@@ -148,6 +208,9 @@ fn is_pseudo(fs_type: &str, mount_point: &Path) -> bool {
     // volume is somewhere a user actually stores things.
     if mount.starts_with("/System/Volumes/") && mount != "/System/Volumes/Data" {
         return true;
+    }
+    if mount == "/run/media" || mount.starts_with("/run/media/") {
+        return false;
     }
     PSEUDO_PREFIXES
         .iter()
@@ -334,6 +397,7 @@ fn collect() -> Vec<Filesystem> {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone)]
 struct MountRow {
     device: String,
     mount_point: PathBuf,
@@ -341,8 +405,20 @@ struct MountRow {
     options: String,
 }
 
+#[cfg(all(test, target_os = "linux"))]
+std::thread_local! {
+    static TEST_PROC_MOUNTS: std::cell::RefCell<Option<Vec<MountRow>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 #[cfg(target_os = "linux")]
 fn read_proc_mounts() -> Vec<MountRow> {
+    #[cfg(test)]
+    if let Some(rows) = TEST_PROC_MOUNTS.with(|override_| override_.borrow().clone()) {
+        return rows;
+    }
+
     let Ok(contents) = std::fs::read_to_string("/proc/mounts") else {
         return Vec::new();
     };
@@ -516,8 +592,137 @@ mod tests {
         assert!(!is_pseudo("apfs", Path::new("/System/Volumes/Data")));
         assert!(!is_pseudo("ext4", Path::new("/")));
         assert!(!is_pseudo("ext4", Path::new("/home")));
+        assert!(!is_pseudo("ext4", Path::new("/run/media/alice/backup")));
+        assert!(is_pseudo("tmpfs", Path::new("/run/media")));
+        assert!(is_pseudo("ext4", Path::new("/run/systemd")));
         // A directory that merely starts with the same letters is not /dev.
         assert!(!is_pseudo("ext4", Path::new("/development")));
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ProcMountsOverride(Option<Vec<MountRow>>);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ProcMountsOverride {
+        fn drop(&mut self) {
+            TEST_PROC_MOUNTS.with(|override_| {
+                *override_.borrow_mut() = self.0.take();
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_proc_mounts<T>(rows: Vec<MountRow>, f: impl FnOnce() -> T) -> T {
+        let previous = TEST_PROC_MOUNTS.with(|override_| override_.replace(Some(rows)));
+        let _override = ProcMountsOverride(previous);
+        f()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pseudo_mount_points_reads_the_proc_mount_source() {
+        let rows = vec![
+            MountRow {
+                device: "/dev/root".into(),
+                mount_point: PathBuf::from("/"),
+                fs_type: "ext4".into(),
+                options: "rw".into(),
+            },
+            MountRow {
+                device: "proc".into(),
+                mount_point: PathBuf::from("/proc"),
+                fs_type: "proc".into(),
+                options: "rw".into(),
+            },
+        ];
+
+        let mounts = with_proc_mounts(rows, pseudo_mount_points);
+
+        assert_eq!(mounts, vec![PathBuf::from("/proc")]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_real_filesystem_mounted_over_an_autofs_placeholder_is_not_skipped() {
+        let rows = vec![
+            MountRow {
+                device: "/dev/root".into(),
+                mount_point: PathBuf::from("/"),
+                fs_type: "ext4".into(),
+                options: "rw".into(),
+            },
+            // systemd-style automount: an autofs placeholder mounted first...
+            MountRow {
+                device: "systemd-1".into(),
+                mount_point: PathBuf::from("/boot"),
+                fs_type: "autofs".into(),
+                options: "rw".into(),
+            },
+            // ...and the real filesystem mounted on top of it once touched.
+            MountRow {
+                device: "/dev/sda1".into(),
+                mount_point: PathBuf::from("/boot"),
+                fs_type: "vfat".into(),
+                options: "rw".into(),
+            },
+        ];
+
+        assert_eq!(pseudo_mount_points_from_rows(rows), Vec::<PathBuf>::new());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pseudo_filesystem_mounted_over_a_real_one_is_still_skipped() {
+        let rows = vec![
+            MountRow {
+                device: "/dev/root".into(),
+                mount_point: PathBuf::from("/"),
+                fs_type: "ext4".into(),
+                options: "rw".into(),
+            },
+            MountRow {
+                device: "/dev/sda1".into(),
+                mount_point: PathBuf::from("/tmp"),
+                fs_type: "ext4".into(),
+                options: "rw".into(),
+            },
+            // /tmp remounted as tmpfs on top of the real filesystem.
+            MountRow {
+                device: "tmpfs".into(),
+                mount_point: PathBuf::from("/tmp"),
+                fs_type: "tmpfs".into(),
+                options: "rw".into(),
+            },
+        ];
+
+        assert_eq!(
+            pseudo_mount_points_from_rows(rows),
+            vec![PathBuf::from("/tmp")]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pseudo_mount_collection_keeps_later_rows_from_the_same_device() {
+        let rows = vec![
+            MountRow {
+                device: "/dev/root".into(),
+                mount_point: PathBuf::from("/"),
+                fs_type: "ext4".into(),
+                options: "rw".into(),
+            },
+            MountRow {
+                device: "/dev/root".into(),
+                mount_point: PathBuf::from("/snap/core/1"),
+                fs_type: "ext4".into(),
+                options: "rw,bind".into(),
+            },
+        ];
+
+        assert_eq!(
+            pseudo_mount_points_from_rows(rows),
+            vec![PathBuf::from("/snap/core/1")]
+        );
     }
 
     #[test]

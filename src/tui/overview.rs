@@ -190,7 +190,7 @@ fn incomplete_note(entry: &DiskEntry) -> Option<String> {
         ScanState::Complete => None,
         ScanState::Denied => Some("unreadable".to_string()),
         ScanState::Cancelled => Some("scan cancelled — sizes incomplete".to_string()),
-        ScanState::Skipped => Some("not scanned — network mount".to_string()),
+        ScanState::Skipped => Some("not scanned — mount point".to_string()),
         ScanState::Partial => Some("some folders skipped or unreadable".to_string()),
     }
 }
@@ -348,4 +348,21 @@ fn draw_largest(frame: &mut Frame, area: Rect, app: &App) {
     }));
 
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use disko_core::EntryType;
+
+    #[test]
+    fn skipped_entries_use_a_reason_valid_for_every_mount_kind() {
+        let mut entry = DiskEntry::new("mounted", EntryType::Directory);
+        entry.scan_state = ScanState::Skipped;
+
+        assert_eq!(
+            incomplete_note(&entry).as_deref(),
+            Some("not scanned — mount point")
+        );
+    }
 }

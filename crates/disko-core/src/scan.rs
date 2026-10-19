@@ -171,6 +171,7 @@ struct Ctx<'a> {
     root_device: u64,
     /// Mount points to stop at, resolved once before the walk starts.
     remote_mounts: Vec<PathBuf>,
+    system_mounts: Vec<PathBuf>,
     /// (device, inode) pairs already counted, for hard-link dedup.
     seen_links: Mutex<HashSet<(u64, u64)>>,
 }
@@ -178,6 +179,14 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     fn is_remote_mount(&self, path: &Path) -> bool {
         self.remote_mounts.iter().any(|mount| mount == path)
+    }
+
+    /// `system_mounts` is sorted and deduplicated by `system_mount_points_from`;
+    /// on Linux it can hold hundreds of rows and is consulted per directory.
+    fn is_system_mount(&self, path: &Path) -> bool {
+        self.system_mounts
+            .binary_search_by(|mount| mount.as_path().cmp(path))
+            .is_ok()
     }
 
     /// True the first time this inode is seen, false for every later link.
@@ -205,16 +214,13 @@ pub fn scan(
     let meta =
         fs::symlink_metadata(&root).with_context(|| format!("cannot stat {}", root.display()))?;
 
-    let remote_mounts = if options.skip_remote {
-        crate::mounts::remote_mount_points()
-            .into_iter()
-            // Scanning a network mount on purpose is allowed; wandering into
-            // one by accident is what this guards against.
-            .filter(|mount| mount != &root)
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let (remote_mounts, system_mounts) = crate::mounts::scan_boundaries(options.skip_remote);
+    let remote_mounts = remote_mounts
+        .into_iter()
+        // Scanning a network mount on purpose is allowed; wandering into
+        // one by accident is what this guards against.
+        .filter(|mount| mount != &root)
+        .collect();
 
     let ctx = Ctx {
         options,
@@ -222,6 +228,7 @@ pub fn scan(
         cancel,
         root_device: device_of(&meta),
         remote_mounts,
+        system_mounts: system_mount_points(&root, system_mounts),
         seen_links: Mutex::new(HashSet::new()),
     };
 
@@ -322,7 +329,10 @@ fn scan_dir(path: &Path, meta: &Metadata, depth: usize, ctx: &Ctx) -> DiskEntry 
 
             let crosses_filesystem =
                 ctx.options.one_file_system && device_of(&child_meta) != ctx.root_device;
-            if crosses_filesystem || ctx.is_remote_mount(&child_path) {
+            if crosses_filesystem
+                || ctx.is_system_mount(&child_path)
+                || ctx.is_remote_mount(&child_path)
+            {
                 let mut skipped = entry_at(&child_path, depth + 1, EntryType::Directory);
                 skipped.modified = modified_of(&child_meta);
                 skipped.scan_state = ScanState::Skipped;
@@ -447,6 +457,42 @@ fn link_count(_meta: &Metadata) -> u64 {
     1
 }
 
+fn system_mount_points(root: &Path, discovered: Vec<PathBuf>) -> Vec<PathBuf> {
+    #[cfg(test)]
+    if let Some(mounts) = TEST_SYSTEM_MOUNTS.with(|override_| override_.borrow().clone()) {
+        return system_mount_points_from(root, mounts);
+    }
+
+    system_mount_points_from(root, discovered)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_SYSTEM_MOUNTS: std::cell::RefCell<Option<Vec<PathBuf>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// sysinfo only reports browsable volumes on macOS, so devfs and the
+/// synthetic volumes never reach `scan_boundaries`; they are named here.
+#[cfg(target_os = "macos")]
+const MACOS_SYSTEM_MOUNTS: [&str; 4] = [
+    "/dev",
+    "/System/Volumes",
+    "/Volumes",
+    "/System/Volumes/Data/Volumes",
+];
+#[cfg(not(target_os = "macos"))]
+const MACOS_SYSTEM_MOUNTS: [&str; 0] = [];
+
+fn system_mount_points_from(root: &Path, mut mounts: Vec<PathBuf>) -> Vec<PathBuf> {
+    mounts.extend(MACOS_SYSTEM_MOUNTS.into_iter().map(PathBuf::from));
+    mounts.retain(|mount| mount != root);
+    mounts.sort();
+    mounts.dedup();
+    mounts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +528,22 @@ mod tests {
     fn scan_tree(root: &Path, options: ScanOptions) -> DiskEntry {
         let progress = Progress::default();
         scan(root, &options, &progress, &Cancel::new()).unwrap()
+    }
+
+    fn with_system_mounts<T>(mounts: Vec<PathBuf>, test: impl FnOnce() -> T) -> T {
+        struct Reset(Option<Vec<PathBuf>>);
+
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_SYSTEM_MOUNTS.with(|override_| {
+                    override_.replace(self.0.take());
+                });
+            }
+        }
+
+        let previous = TEST_SYSTEM_MOUNTS.with(|override_| override_.replace(Some(mounts)));
+        let _reset = Reset(previous);
+        test()
     }
 
     #[test]
@@ -729,5 +791,84 @@ mod tests {
 
         assert_eq!(raw.apparent_size - deduped.apparent_size, 4096);
         assert_eq!(deduped.items, raw.items);
+    }
+
+    #[test]
+    fn system_mount_points_are_skipped() {
+        let mounts = system_mount_points(Path::new("/not-a-mount"), Vec::new());
+        #[cfg(target_os = "macos")]
+        {
+            assert!(mounts.contains(&PathBuf::from("/System/Volumes")));
+            assert!(mounts.contains(&PathBuf::from("/Volumes")));
+            assert!(mounts.contains(&PathBuf::from("/dev")));
+            assert!(mounts.contains(&PathBuf::from("/System/Volumes/Data/Volumes")));
+        }
+        assert!(!mounts.contains(&PathBuf::from("/not-a-mount")));
+    }
+
+    #[test]
+    fn scan_wires_discovered_system_mounts_into_the_skip_branch() {
+        let tree = TempTree::new("system-mount-wiring");
+        let mount = tree.0.join("mounted");
+        fs::create_dir(&mount).unwrap();
+        tree.file("mounted/external.bin", 4096);
+        let mount = mount.canonicalize().unwrap();
+
+        let scanned = with_system_mounts(vec![mount.clone()], || {
+            scan_tree(&tree.0, ScanOptions::default())
+        });
+        let skipped = scanned.resolve(&mount).unwrap();
+
+        assert_eq!(skipped.scan_state, ScanState::Skipped);
+        assert!(skipped.children.is_empty());
+    }
+
+    #[test]
+    fn discovered_pseudo_mounts_are_included_except_for_an_explicit_root() {
+        let mounts = vec![PathBuf::from("/snap/core/1"), PathBuf::from("/proc")];
+
+        let filtered = system_mount_points_from(Path::new("/proc"), mounts);
+
+        assert!(filtered.contains(&PathBuf::from("/snap/core/1")));
+        assert!(!filtered.contains(&PathBuf::from("/proc")));
+    }
+
+    #[test]
+    fn scan_dir_routes_configured_system_mounts_through_the_skip_branch() {
+        let tree = TempTree::new("system-mount");
+        let mount = tree.0.join("mounted");
+        fs::create_dir(&mount).unwrap();
+        tree.file("mounted/external.bin", 4096);
+        let root = tree.0.canonicalize().unwrap();
+        let mount = mount.canonicalize().unwrap();
+        let meta = fs::symlink_metadata(&root).unwrap();
+        let options = ScanOptions::default();
+        let progress = Progress::default();
+        let cancel = Cancel::new();
+        let ctx = Ctx {
+            options: &options,
+            progress: &progress,
+            cancel: &cancel,
+            root_device: device_of(&meta),
+            remote_mounts: Vec::new(),
+            system_mounts: vec![mount.clone()],
+            seen_links: Mutex::new(HashSet::new()),
+        };
+
+        let scanned = scan_dir(&root, &meta, 0, &ctx);
+        let skipped = scanned.resolve(&mount).unwrap();
+
+        assert_eq!(skipped.scan_state, ScanState::Skipped);
+        assert!(skipped.children.is_empty());
+
+        let ordinary = root.join("ordinary");
+        fs::create_dir(&ordinary).unwrap();
+        tree.file("ordinary/local.bin", 1024);
+        let scanned = scan_dir(&root, &meta, 0, &ctx);
+        let skipped = scanned.resolve(&mount).unwrap();
+
+        assert_eq!(skipped.scan_state, ScanState::Skipped);
+        assert!(skipped.children.is_empty());
+        assert!(scanned.resolve(&ordinary.join("local.bin")).is_some());
     }
 }
