@@ -214,7 +214,7 @@ fn core_content_survives_terminal_widths() {
 fn deep_breadcrumbs_keep_their_last_folder_in_narrow_split_panes() {
     let mut deep_app = app();
     deep_app.cwd =
-        PathBuf::from("/Users/cesar/work/monorepo/fix/x-pack/packages/core-management/src/client");
+        PathBuf::from("/Users/cesar/code/project/services/api/internal/handlers/v2/src/client");
     deep_app.view = View::Explorer;
 
     let screen = joined(&render_lines(&mut deep_app, 40, 30).unwrap());
