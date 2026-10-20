@@ -1,16 +1,16 @@
 //! Interactive state: what is on screen, what is selected, and what a key does.
 
-use std::cell::{Ref, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use disko_core::scan::{self, Cancel, Finished, Progress};
 use disko_core::{Diff, DiskEntry, Filesystem, ScanOptions, SizeKind, Unit};
-use disko_render::{RadialNode, palette};
+use disko_render::{LayoutOptions, RadialNode, Segment, palette, radial};
 
 use crate::deletion::{self, DeleteProgress, Outcome, Target};
 use crate::model::{self, Metric, Row, RowOptions, Sort};
@@ -169,18 +169,62 @@ impl Deleting {
     }
 }
 
-/// The sunburst for one directory: the tree the layout runs over, and the
-/// table taking a path back to the wedge id standing for it.
+/// The sunburst for one directory: the tree the layout runs over, the table
+/// taking a path back to the wedge id standing for it, and the layout itself,
+/// shared by every selection.
 pub struct RadialCache {
     key: RadialKey,
     pub root: RadialNode,
     ids: HashMap<PathBuf, usize>,
+    visible: OnceLock<Segments>,
+    /// Includes slivers, built only when one needs to be highlighted.
+    all: OnceLock<Vec<Segment>>,
 }
+
+type Segments = Arc<Vec<Segment>>;
 
 impl RadialCache {
     /// The wedge drawn for `path`, if it is one of the ones drawn at all.
     pub fn id_of(&self, path: &Path) -> Option<usize> {
         self.ids.get(path).copied()
+    }
+
+    /// The normal wedges plus the selected sliver, if it was too thin to draw.
+    /// Both layouts assign ids in layout order, so inserting by id preserves
+    /// the sibling order used to highlight a run of tiny wedges.
+    pub fn segments(&self, pinned: Option<usize>) -> Segments {
+        let rings = self.key.rings;
+        let visible = self.visible.get_or_init(|| {
+            Arc::new(radial::layout(
+                &self.root,
+                &LayoutOptions {
+                    rings,
+                    ..Default::default()
+                },
+            ))
+        });
+        let Some(id) = pinned else {
+            return Arc::clone(visible);
+        };
+        let Err(at) = visible.binary_search_by_key(&id, |segment| segment.id) else {
+            return Arc::clone(visible);
+        };
+        let all = self.all.get_or_init(|| {
+            radial::layout(
+                &self.root,
+                &LayoutOptions {
+                    rings,
+                    min_span: 0.0,
+                    ..Default::default()
+                },
+            )
+        });
+        let Ok(selected) = all.binary_search_by_key(&id, |segment| segment.id) else {
+            return Arc::clone(visible);
+        };
+        let mut segments = visible.as_ref().clone();
+        segments.insert(at, all[selected].clone());
+        Arc::new(segments)
     }
 }
 
@@ -248,7 +292,7 @@ pub struct App {
     /// How many times the tree behind the view has been replaced or edited.
     revision: u64,
     /// The last sunburst built, kept for as long as it stands.
-    radial: RefCell<Option<RadialCache>>,
+    radial: RefCell<Option<Arc<RadialCache>>>,
 }
 
 impl App {
@@ -974,7 +1018,7 @@ impl App {
     /// Building it walks `rings` levels of the tree and clones a path per node,
     /// which is far too much to redo for every keystroke — so the last one is
     /// kept until something it was built from moves.
-    pub fn radial_tree(&self, rings: usize) -> Ref<'_, RadialCache> {
+    pub fn radial_tree(&self, rings: usize) -> Arc<RadialCache> {
         let key = RadialKey {
             cwd: self.cwd.clone(),
             rings,
@@ -983,17 +1027,14 @@ impl App {
             revision: self.revision,
         };
 
-        let stale = match &*self.radial.borrow() {
-            Some(cache) => cache.key != key,
-            None => true,
-        };
-        if stale {
-            *self.radial.borrow_mut() = Some(self.build_radial(key));
+        if let Some(cache) = &*self.radial.borrow()
+            && cache.key == key
+        {
+            return Arc::clone(cache);
         }
-
-        Ref::map(self.radial.borrow(), |cache| {
-            cache.as_ref().expect("the cache was just filled")
-        })
+        let cache = Arc::new(self.build_radial(key));
+        *self.radial.borrow_mut() = Some(Arc::clone(&cache));
+        cache
     }
 
     fn build_radial(&self, key: RadialKey) -> RadialCache {
@@ -1022,6 +1063,8 @@ impl App {
                 .enumerate()
                 .map(|(id, path)| (path, id))
                 .collect(),
+            visible: OnceLock::new(),
+            all: OnceLock::new(),
         }
     }
 
@@ -1418,6 +1461,44 @@ mod tests {
         }]);
         assert_eq!(app.revision, 1);
         assert_eq!(app.radial_tree(2).id_of(Path::new("/root/small")), None);
+    }
+
+    /// The explorer lays a directory out once and adds the selected sliver
+    /// to that, rather than laying it out again for every selection. What it
+    /// draws must be what a layout pinned to the selection would have drawn.
+    #[test]
+    fn the_shared_layout_places_a_selected_sliver_like_a_pinned_layout() {
+        let mut children = vec![entry("/root/big", 100_000, vec![])];
+        for index in 0..40 {
+            let path = format!("/root/tiny{index:02}");
+            children.push(entry(
+                &path,
+                10,
+                vec![entry(&format!("{path}/in"), 10, vec![])],
+            ));
+        }
+        let mut app = App::new(settings(), false);
+        app.root = PathBuf::from("/root");
+        app.cwd = PathBuf::from("/root");
+        app.tree = Some(entry("/root", 100_400, children));
+
+        let cache = app.radial_tree(3);
+        let visible = cache.segments(None).len();
+        for id in 0..cache.ids.len() {
+            let pinned = radial::layout(
+                &cache.root,
+                &LayoutOptions {
+                    rings: 3,
+                    pinned: Some(id),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(*cache.segments(Some(id)), pinned, "selected id {id}");
+        }
+        assert!(
+            cache.segments(Some(5)).len() > visible,
+            "a sliver should have been added"
+        );
     }
 
     #[test]

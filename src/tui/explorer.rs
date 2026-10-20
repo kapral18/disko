@@ -1,18 +1,21 @@
 //! The radial explorer: a sunburst of the current directory, with a legend
 //! tying every wedge to a name and a size.
 
+use std::sync::{Arc, Weak};
+
 use disko_core::size::{Unit, format};
-use disko_render::radial::{self, Drawn, LayoutOptions, RenderOptions, Segment};
+use disko_render::radial::{self, Drawn, RenderOptions};
 use disko_render::{BrailleCanvas, Canvas, Rgb, palette};
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Widget};
 
 use crate::model::Row;
 use crate::report::signed;
-use crate::tui::app::App;
+use crate::tui::app::{App, RadialCache};
 use crate::tui::text::{fit, truncate, width};
 use crate::tui::theme;
 
@@ -22,7 +25,124 @@ const RINGS: usize = 3;
 
 const LEGEND_WIDTH: u16 = 34;
 
-pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
+/// Only the chart pixels are cached; progress, labels and the legend stay live.
+#[derive(Default)]
+pub(super) struct ChartCache {
+    frame: Option<ChartFrame>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ChartKey {
+    width: u16,
+    height: u16,
+    no_color: bool,
+}
+
+struct ChartFrame {
+    // Which sunburst this was drawn from. Weak, so a frame left over from an
+    // old tree does not keep that tree alive.
+    source: Weak<RadialCache>,
+    key: ChartKey,
+    pixels: ChartPixels,
+    selected: Option<usize>,
+    buffer: Buffer,
+    drawn: Drawn,
+}
+
+enum ChartPixels {
+    Color {
+        raster: radial::Raster,
+        canvas: Canvas,
+    },
+    Outline(BrailleCanvas),
+}
+
+impl ChartFrame {
+    fn new(source: &Arc<RadialCache>, key: ChartKey, selected: Option<usize>) -> Self {
+        let area = Rect::new(0, 0, key.width, key.height);
+        let pixels = if key.no_color {
+            ChartPixels::Outline(BrailleCanvas::new(key.width as usize, key.height as usize))
+        } else {
+            let canvas = Canvas::new(key.width as usize, key.height as usize);
+            let raster = radial::Raster::new(
+                &source.segments(None),
+                canvas.width(),
+                canvas.height(),
+                &RenderOptions {
+                    rings: RINGS,
+                    ..Default::default()
+                },
+            );
+            ChartPixels::Color { raster, canvas }
+        };
+        let mut frame = Self {
+            source: Arc::downgrade(source),
+            key,
+            pixels,
+            selected,
+            buffer: Buffer::empty(area),
+            drawn: Drawn::default(),
+        };
+        frame.select(source, selected);
+        frame
+    }
+
+    fn select(&mut self, source: &RadialCache, selected: Option<usize>) {
+        let segments = source.segments(selected);
+        self.buffer.reset();
+        self.drawn = match &mut self.pixels {
+            ChartPixels::Color { raster, canvas } => {
+                canvas.clear();
+                let drawn = raster.paint(&segments, canvas, selected);
+                color_cells(canvas, &mut self.buffer);
+                drawn
+            }
+            ChartPixels::Outline(canvas) => {
+                canvas.clear();
+                let drawn = radial::render_outline(
+                    &segments,
+                    canvas,
+                    &RenderOptions {
+                        rings: RINGS,
+                        selected,
+                        ..Default::default()
+                    },
+                );
+                let lines: Vec<_> = canvas.lines().into_iter().map(Line::from).collect();
+                Paragraph::new(lines).render(self.buffer.area, &mut self.buffer);
+                drawn
+            }
+        };
+        self.selected = selected;
+    }
+}
+
+fn color_cells(canvas: &Canvas, buffer: &mut Buffer) {
+    for (row, cells) in canvas
+        .cell_rows()
+        .into_iter()
+        .zip(buffer.content.chunks_exact_mut(canvas.width()))
+    {
+        for (half, cell) in row.into_iter().zip(cells) {
+            match (half.top, half.bottom) {
+                (None, None) => {}
+                (Some(top), None) => {
+                    cell.set_symbol("▀").set_fg(theme::color(top));
+                }
+                (None, Some(bottom)) => {
+                    cell.set_symbol("▄").set_fg(theme::color(bottom));
+                }
+                (Some(top), Some(bottom)) => {
+                    cell.set_symbol("▀")
+                        .set_fg(theme::color(top))
+                        .set_bg(theme::color(bottom));
+                }
+            }
+        }
+    }
+}
+
+pub fn draw(frame: &mut Frame, area: Rect, app: &App, chart: &mut ChartCache) {
     let chunks = Layout::vertical([
         Constraint::Length(1), // breadcrumb
         Constraint::Length(1),
@@ -38,7 +158,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         .split(chunks[2]);
 
     let rows = app.rows();
-    let drawn = draw_chart(frame, body[0], app, &rows);
+    let drawn = draw_chart(frame, body[0], app, &rows, chart);
     if legend_width > 0 {
         draw_legend(frame, body[1], app, &rows);
     }
@@ -82,7 +202,13 @@ fn note(app: &App, rows: &[Row], drawn: Drawn) -> Option<String> {
     })
 }
 
-fn draw_chart(frame: &mut Frame, area: Rect, app: &App, rows: &[Row]) -> Drawn {
+fn draw_chart(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    rows: &[Row],
+    chart: &mut ChartCache,
+) -> Drawn {
     if area.width < 8 || area.height < 4 {
         return Drawn::default();
     }
@@ -96,79 +222,31 @@ fn draw_chart(frame: &mut Frame, area: Rect, app: &App, rows: &[Row]) -> Drawn {
         .and_then(|row| row.path.as_deref())
         .and_then(|path| cache.id_of(path));
 
-    let segments = radial::layout(
-        &cache.root,
-        &LayoutOptions {
-            rings: RINGS,
-            // Most of a big directory is slivers, and the row under the cursor
-            // is usually one of them. Place it regardless so the highlight has
-            // somewhere to land.
-            pinned: selected_id,
-            ..Default::default()
-        },
-    );
-
-    let options = RenderOptions {
-        rings: RINGS,
-        selected: selected_id,
-        ..Default::default()
+    let key = ChartKey {
+        width: area.width,
+        height: area.height,
+        no_color: theme::colors_disabled(),
     };
-
-    let (lines, drawn) = if theme::colors_disabled() {
-        outline_lines(&segments, area, &options)
-    } else {
-        color_lines(&segments, area, &options)
-    };
-
-    frame.render_widget(Paragraph::new(lines), area);
+    let cached = chart
+        .frame
+        .get_or_insert_with(|| ChartFrame::new(&cache, key, selected_id));
+    if cached.key != key || !cached.source.ptr_eq(&Arc::downgrade(&cache)) {
+        *cached = ChartFrame::new(&cache, key, selected_id);
+    } else if cached.selected != selected_id {
+        cached.select(&cache, selected_id);
+    }
+    let buffer = frame.buffer_mut();
+    for (y, row) in cached
+        .buffer
+        .content
+        .chunks_exact(area.width as usize)
+        .enumerate()
+    {
+        let start = buffer.index_of(area.x, area.y + y as u16);
+        buffer.content[start..start + row.len()].clone_from_slice(row);
+    }
     draw_hole(frame, area, app);
-    drawn
-}
-
-fn color_lines(
-    segments: &[Segment],
-    area: Rect,
-    options: &RenderOptions,
-) -> (Vec<Line<'static>>, Drawn) {
-    let mut canvas = Canvas::new(area.width as usize, area.height as usize);
-    let drawn = radial::render(segments, &mut canvas, options);
-
-    let lines = canvas
-        .cell_rows()
-        .into_iter()
-        .map(|row| {
-            Line::from(
-                row.into_iter()
-                    .map(|cell| match (cell.top, cell.bottom) {
-                        (None, None) => Span::raw(" "),
-                        (Some(top), None) => {
-                            Span::styled("▀", Style::default().fg(theme::color(top)))
-                        }
-                        (None, Some(bottom)) => {
-                            Span::styled("▄", Style::default().fg(theme::color(bottom)))
-                        }
-                        (Some(top), Some(bottom)) => Span::styled(
-                            "▀",
-                            Style::default()
-                                .fg(theme::color(top))
-                                .bg(theme::color(bottom)),
-                        ),
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect();
-    (lines, drawn)
-}
-
-fn outline_lines(
-    segments: &[Segment],
-    area: Rect,
-    options: &RenderOptions,
-) -> (Vec<Line<'static>>, Drawn) {
-    let mut canvas = BrailleCanvas::new(area.width as usize, area.height as usize);
-    let drawn = radial::render_outline(segments, &mut canvas, options);
-    (canvas.lines().into_iter().map(Line::from).collect(), drawn)
+    cached.drawn
 }
 
 /// The hole in the middle carries the total for the directory you are in —
