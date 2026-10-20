@@ -12,6 +12,7 @@ use disko_core::scan::{self, Cancel, Finished, Progress};
 use disko_core::{Diff, DiskEntry, Filesystem, ScanOptions, SizeKind, Unit};
 use disko_render::{RadialNode, palette};
 
+use super::preferences::BrowseView;
 use crate::deletion::{self, DeleteProgress, Outcome, Target};
 use crate::model::{self, Metric, Row, RowOptions, Sort};
 
@@ -96,10 +97,19 @@ pub enum View {
     Picker,
     /// A scan is running.
     Scanning,
-    /// The ranked overview — the default answer to "what is using the space".
+    /// The ranked list of what is using the space.
     Overview,
     /// The radial explorer.
     Explorer,
+}
+
+impl From<BrowseView> for View {
+    fn from(view: BrowseView) -> Self {
+        match view {
+            BrowseView::Chart => Self::Explorer,
+            BrowseView::List => Self::Overview,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +217,8 @@ struct Session {
 pub struct App {
     pub settings: Settings,
     pub view: View,
+    /// The view scans open on: the one Tab last picked.
+    pub(super) browsing_view: BrowseView,
     pub filesystems: Vec<Filesystem>,
     pub picker_index: usize,
     pub tree: Option<DiskEntry>,
@@ -257,6 +269,7 @@ impl App {
         Self {
             settings,
             view: View::Picker,
+            browsing_view: BrowseView::default(),
             filesystems,
             picker_index: 0,
             tree: None,
@@ -287,6 +300,19 @@ impl App {
             revision: 0,
             radial: RefCell::new(None),
         }
+    }
+
+    /// Show the chart or the list. The list is capped at `--top` rows and the
+    /// chart is not, so the cursor is kept on a row that exists.
+    pub(super) fn show_view(&mut self, view: BrowseView) {
+        self.view = view.into();
+        self.selection = self.selection.min(self.rows().len().saturating_sub(1));
+    }
+
+    /// Show a view and make it the one later scans open on.
+    pub(super) fn set_browsing_view(&mut self, view: BrowseView) {
+        self.browsing_view = view;
+        self.show_view(view);
     }
 
     /// Rescan on a timer and report growth since the moment watching started.
@@ -344,7 +370,7 @@ impl App {
             {
                 self.tree = Some(snapshot.tree);
                 self.provisional = Some(snapshot.taken_at);
-                self.view = View::Overview;
+                self.view = self.browsing_view.into();
             }
         } else if let Some(previous) = self.tree.take() {
             // A rescan builds a whole second tree before it can replace this
@@ -504,8 +530,10 @@ impl App {
         // Whatever is on screen is now the real thing.
         self.provisional = None;
         self.streamed.clear();
-        if self.mode == ScanMode::Fresh {
-            self.view = View::Overview;
+        // A view already on screen (a snapshot painted while the scan ran)
+        // stays whichever one the user stepped to.
+        if self.mode == ScanMode::Fresh && self.view == View::Scanning {
+            self.view = self.browsing_view.into();
         }
         // A snapshot's tree is pruned, so the cursor may have been sitting on
         // a row that the full scan renders differently.
@@ -1370,6 +1398,23 @@ mod tests {
         assert_eq!(app.breadcrumb(), "/root");
         app.cwd = PathBuf::from("/root/big/inner");
         assert_eq!(app.breadcrumb(), "/root › big › inner");
+    }
+
+    /// A fresh scan opens on the saved view, but only if nothing is on screen
+    /// yet: someone who stepped to the other view while a snapshot was
+    /// painted stays there when the scan lands.
+    #[test]
+    fn a_landing_scan_keeps_the_view_stepped_to_over_a_snapshot() {
+        let mut app = app_with_tree();
+        let tree = app.tree.clone().unwrap();
+
+        app.view = View::Scanning;
+        app.absorb_scan(tree.clone());
+        assert_eq!(app.view, View::Explorer, "nothing was on screen yet");
+
+        app.view = View::Overview;
+        app.absorb_scan(tree);
+        assert_eq!(app.view, View::Overview);
     }
 
     #[test]

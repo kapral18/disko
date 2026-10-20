@@ -33,7 +33,8 @@ pub struct Cli {
 /// works as readily as `disko --json diff`.
 #[derive(Parser, Debug, Clone)]
 pub struct Options {
-    /// Show only the N largest entries, grouping the rest as "Other".
+    /// Limit the list view and text output to N entries, grouping the rest
+    /// as "Other".
     #[arg(
         short = 't',
         long,

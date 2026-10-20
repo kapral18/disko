@@ -114,7 +114,7 @@ fn the_overview_answers_the_three_questions() {
     assert!(screen.contains("/Users/cesar"), "{screen}");
 
     // And the keys to go on with.
-    assert!(screen.contains("Enter explore"));
+    assert!(screen.contains("Tab chart"));
     assert!(screen.contains("q quit"));
 }
 
@@ -141,7 +141,7 @@ fn filesystem_language_stays_out_of_the_default_view() {
     for jargon in ["apfs", "/dev/disk3s1s1", "inode", "block"] {
         assert!(
             !screen.to_lowercase().contains(jargon),
-            "{jargon} should live behind d/--details, but the default view shows:\n{screen}"
+            "{jargon} should live behind d/--details, but the list view shows:\n{screen}"
         );
     }
 }
@@ -692,6 +692,34 @@ fn app_over(root: &std::path::Path) -> App {
     app
 }
 
+/// Run the scan `app` started until it lands.
+fn finish_scan(app: &mut App) {
+    let started = std::time::Instant::now();
+    while app.view == View::Scanning {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "scan never landed"
+        );
+        app.poll_scan();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn a_scan_opens_on_the_chart_unless_the_list_was_picked() {
+    let sandbox = Sandbox::new("browse-view");
+    let mut app = app_over(&sandbox.0);
+    app.view = View::Picker;
+    let mut app = app.with_path(&sandbox.0);
+    finish_scan(&mut app);
+    assert_eq!(app.view, View::Explorer);
+
+    press(&mut app, KeyCode::Tab);
+    app.start_scan(&sandbox.0);
+    finish_scan(&mut app);
+    assert_eq!(app.view, View::Overview);
+}
+
 fn type_word(app: &mut App, word: &str) {
     for ch in word.chars() {
         press(app, KeyCode::Char(ch));
@@ -1122,12 +1150,8 @@ fn the_way_out_survives_even_the_narrowest_terminal() {
             let lines = render_lines(&mut app, width, 30).unwrap();
             let footer = lines.last().unwrap();
 
-            let escape = match view {
-                View::Explorer => "Esc",
-                _ => "q",
-            };
             assert!(
-                footer.contains(escape),
+                footer.contains("q quit"),
                 "{view:?} at {width} columns lost its way out: {footer:?}"
             );
             assert!(
@@ -1153,8 +1177,8 @@ fn hints_are_dropped_from_the_least_important_end() {
         .clone();
 
     // The most useful hint stays, the tail goes.
-    assert!(wide.contains("Enter explore"), "{wide}");
-    assert!(narrow.contains("Enter explore"), "{narrow}");
+    assert!(wide.contains("Tab chart"), "{wide}");
+    assert!(narrow.contains("Tab chart"), "{narrow}");
     assert!(wide.contains("d details"), "{wide}");
     assert!(!narrow.contains("d details"), "{narrow}");
 }
