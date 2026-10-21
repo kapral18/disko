@@ -221,8 +221,8 @@ fn remove(
                 continue;
             }
             match crate::deletion::delete(path) {
-                Ok(()) => {
-                    freed += group.size / group.paths.len().max(1) as u64;
+                Ok(removed_bytes) => {
+                    freed = freed.saturating_add(removed_bytes);
                     writeln!(out, " removed {}", display_path(path))?;
                 }
                 Err(error) => {
@@ -374,7 +374,11 @@ mod tests {
 
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("no longer a recognised cache"), "{text}");
-        assert!(text.contains("Freed 0 B"), "{text}");
+        let freed = text
+            .lines()
+            .find(|line| line.contains("Freed"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(freed.ends_with(" 0 B"), "{text}");
     }
 
     #[test]
@@ -396,5 +400,64 @@ mod tests {
         entry.allocated_size = 10;
         // Just proving the shape the store wants is the shape a scan gives.
         assert_eq!(disko_core::history::storage_floor(&entry), 1_000_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletion_reports_actual_removed_bytes_not_the_group_estimate() {
+        use std::os::unix::fs::MetadataExt;
+
+        fn allocated(path: &Path) -> u64 {
+            let meta = std::fs::symlink_metadata(path).unwrap();
+            let own = meta.blocks() * 512;
+            if meta.is_dir() {
+                own + std::fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| allocated(&entry.unwrap().path()))
+                    .sum::<u64>()
+            } else {
+                own
+            }
+        }
+
+        let rule = disko_core::categories::RULES
+            .iter()
+            .find(|rule| rule.id == "rust-target")
+            .unwrap();
+        let base =
+            std::env::temp_dir().join(format!("disko-clean-actual-freed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let target = base.join("project/target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(base.join("project/Cargo.toml"), b"[package]").unwrap();
+        std::fs::write(target.join("blob.bin"), b"temporary").unwrap();
+        let actual = allocated(&target);
+        let estimate = actual.saturating_add(1_000_000_000);
+        let groups = vec![Group {
+            rule,
+            size: estimate,
+            last_used: 0,
+            paths: vec![target.as_path()],
+        }];
+        let options = options();
+
+        let mut out = Vec::new();
+        remove(&mut out, &groups, &options, true).unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        // Matched by line rather than as "Freed <size>": on a terminal the
+        // label is wrapped in bold codes.
+        let freed = text
+            .lines()
+            .find(|line| line.contains("Freed"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            freed.ends_with(&format!(
+                " {}",
+                disko_core::size::format(actual, options.unit())
+            )),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(base);
     }
 }

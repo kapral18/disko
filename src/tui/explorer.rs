@@ -58,6 +58,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         crumbs.push(Span::styled(format!("   {note}"), theme::secondary()));
     }
     frame.render_widget(Paragraph::new(Line::from(crumbs)), chunks[0]);
+    crate::tui::overview::draw_totals_warning(frame, chunks[1], app);
 
     crate::tui::footer::draw(frame, chunks[4], app, None);
 }
