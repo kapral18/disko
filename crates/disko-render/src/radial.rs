@@ -312,89 +312,168 @@ impl Highlight {
 /// Paint `segments` into `canvas`. Pixels outside the disc are left alone, so
 /// a caller can compose the sunburst over something else.
 pub fn render(segments: &[Segment], canvas: &mut Canvas, options: &RenderOptions) -> Drawn {
-    let geometry = Geometry::new(canvas.width(), canvas.height(), options);
-    if geometry.ring_thickness <= 0.0 {
-        return Drawn::default();
-    }
+    Raster::new(segments, canvas.width(), canvas.height(), options).paint(
+        segments,
+        canvas,
+        options.selected,
+    )
+}
 
-    let highlight = Highlight::resolve(segments, &geometry, options.selected);
-    let drawn = Drawn {
-        selection_is_a_run: highlight
-            .as_ref()
-            .is_some_and(|highlight| highlight.is_a_run),
-    };
+/// Pixel positions and base colors for a fixed layout and canvas size.
+/// Moving the selection only changes shading; angles, gaps and wedge lookup
+/// are prepared once.
+pub struct Raster {
+    geometry: Geometry,
+    pixels: Vec<RasterPixel>,
+}
 
-    for y in 0..canvas.height() {
-        for x in 0..canvas.width() {
-            let dx = x as f64 + 0.5 - geometry.center_x;
-            let dy = y as f64 + 0.5 - geometry.center_y;
-            let radius = (dx * dx + dy * dy).sqrt();
+struct RasterPixel {
+    x: usize,
+    y: usize,
+    depth: usize,
+    turn: f64,
+    /// Blank wedge gaps can still receive the selected ring's highlight.
+    base: Option<PixelColors>,
+}
 
-            if radius < geometry.inner || radius > geometry.outer {
-                continue;
-            }
+struct PixelColors {
+    id: usize,
+    normal: Rgb,
+    selected: Rgb,
+    dimmed: Rgb,
+}
 
-            let depth = ((radius - geometry.inner) / geometry.ring_thickness).floor() as usize + 1;
-            if depth > options.rings {
-                continue;
-            }
-
-            // Leave the outer sliver of each ring blank so rings read as
-            // separate bands instead of one gradient.
-            let into_ring =
-                (radius - geometry.inner) - (depth - 1) as f64 * geometry.ring_thickness;
-            if into_ring > geometry.ring_thickness - options.ring_gap {
-                continue;
-            }
-
-            let turn = turn_of(dx, dy);
-            let inside = highlight
-                .as_ref()
-                .is_some_and(|highlight| highlight.covers(depth, turn));
-
-            // The selected wedge's own ring is painted straight over the
-            // dividers: one widened to three pixels has nothing to spare for a
-            // gap either side of it. Its contents, further out, keep their
-            // dividers — that structure is the point of drawing them.
-            if let Some(highlight) = &highlight
-                && inside
-                && depth == highlight.depth
-            {
-                canvas.set(x, y, highlight.color);
-                continue;
-            }
-
-            let Some(segment) = segments
-                .iter()
-                .find(|s| s.depth == depth && s.contains(turn))
-            else {
-                continue;
-            };
-
-            // A fixed pixel gap is a shrinking angle as the radius grows, so
-            // the divider stays one pixel wide on every ring.
-            let padding = options.segment_gap / (TAU * radius);
-            if turn - segment.start < padding || segment.end - turn < padding {
-                continue;
-            }
-
-            canvas.set(x, y, shade_for(segment, inside, options));
+impl PixelColors {
+    fn new(segment: &Segment) -> Self {
+        Self {
+            id: segment.id,
+            normal: segment.color,
+            selected: palette::shade(segment.color, SELECTED_SHADE),
+            dimmed: palette::shade(segment.color, DIMMED_SHADE),
         }
     }
 
-    drawn
+    // Descendants keep their true colors inside the slice; brightening them
+    // again would wash the outer rings into each other.
+    fn shade(&self, selected: Option<usize>, inside: bool) -> Rgb {
+        match selected {
+            None => self.normal,
+            Some(id) if id == self.id => self.selected,
+            Some(_) if inside => self.normal,
+            Some(_) => self.dimmed,
+        }
+    }
 }
 
-/// Deeper rings are already lighter shades of their parent, so brightening them
-/// again would wash them into each other. Inside the slice they keep their true
-/// colour, and the contrast comes from everything else stepping back.
-fn shade_for(segment: &Segment, inside_the_slice: bool, options: &RenderOptions) -> Rgb {
-    match options.selected {
-        None => segment.color,
-        Some(id) if id == segment.id => palette::shade(segment.color, SELECTED_SHADE),
-        Some(_) if inside_the_slice => segment.color,
-        Some(_) => palette::shade(segment.color, DIMMED_SHADE),
+impl Raster {
+    /// `width` and `height` are canvas pixels. Selection is supplied to
+    /// [`paint`](Self::paint); the other render options stay fixed.
+    pub fn new(segments: &[Segment], width: usize, height: usize, options: &RenderOptions) -> Self {
+        let geometry = Geometry::new(width, height, options);
+        let mut pixels = Vec::new();
+        if geometry.ring_thickness <= 0.0 {
+            return Self { geometry, pixels };
+        }
+        let mut by_depth: Vec<Vec<&Segment>> = vec![Vec::new(); options.rings + 1];
+        for segment in segments {
+            if segment.depth <= options.rings {
+                by_depth[segment.depth].push(segment);
+            }
+        }
+        for ring in &mut by_depth {
+            ring.sort_by(|a, b| {
+                a.start
+                    .partial_cmp(&b.start)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        for y in 0..height {
+            for x in 0..width {
+                if let Some(pixel) = raster_pixel(x, y, &geometry, &by_depth, options) {
+                    pixels.push(pixel);
+                }
+            }
+        }
+        Self { geometry, pixels }
     }
+
+    /// Paint the current selection using the prepared pixels. `segments`
+    /// must be the base layout, optionally with its selected sliver added.
+    /// Rebuild for any other layout or geometry change. Clear a reused canvas
+    /// between frames; pixels not painted here are left untouched.
+    pub fn paint(
+        &self,
+        segments: &[Segment],
+        canvas: &mut Canvas,
+        selected: Option<usize>,
+    ) -> Drawn {
+        if self.geometry.ring_thickness <= 0.0 {
+            return Drawn::default();
+        }
+        let highlight = Highlight::resolve(segments, &self.geometry, selected);
+        for pixel in &self.pixels {
+            let inside = highlight
+                .as_ref()
+                .is_some_and(|highlight| highlight.covers(pixel.depth, pixel.turn));
+            let color = if let Some(highlight) = &highlight
+                && inside
+                && pixel.depth == highlight.depth
+            {
+                Some(highlight.color)
+            } else {
+                pixel.base.as_ref().map(|base| base.shade(selected, inside))
+            };
+            if let Some(color) = color {
+                canvas.set(pixel.x, pixel.y, color);
+            }
+        }
+        Drawn {
+            selection_is_a_run: highlight.is_some_and(|highlight| highlight.is_a_run),
+        }
+    }
+}
+
+fn raster_pixel(
+    x: usize,
+    y: usize,
+    geometry: &Geometry,
+    by_depth: &[Vec<&Segment>],
+    options: &RenderOptions,
+) -> Option<RasterPixel> {
+    let dx = x as f64 + 0.5 - geometry.center_x;
+    let dy = y as f64 + 0.5 - geometry.center_y;
+    let radius = (dx * dx + dy * dy).sqrt();
+    if radius < geometry.inner || radius > geometry.outer {
+        return None;
+    }
+    let depth = ((radius - geometry.inner) / geometry.ring_thickness).floor() as usize + 1;
+    if depth > options.rings {
+        return None;
+    }
+    let into_ring = (radius - geometry.inner) - (depth - 1) as f64 * geometry.ring_thickness;
+    if into_ring > geometry.ring_thickness - options.ring_gap {
+        return None;
+    }
+
+    let turn = turn_of(dx, dy);
+    let padding = options.segment_gap / (TAU * radius);
+    let base = segment_at_turn(&by_depth[depth], turn)
+        .filter(|segment| !(turn - segment.start < padding || segment.end - turn < padding))
+        .map(PixelColors::new);
+    Some(RasterPixel {
+        x,
+        y,
+        depth,
+        turn,
+        base,
+    })
+}
+
+fn segment_at_turn<'a>(ring: &'a [&'a Segment], turn: f64) -> Option<&'a Segment> {
+    let index = ring.partition_point(|segment| segment.end <= turn);
+    ring.get(index)
+        .copied()
+        .filter(|segment| segment.start <= turn)
 }
 
 /// Draw ring arcs and wedge dividers as dots. The monochrome fallback for
@@ -685,8 +764,8 @@ mod tests {
             ..Default::default()
         };
 
-        let selected = shade_for(&segments[0], true, &options);
-        let other = shade_for(&segments[1], false, &options);
+        let selected = PixelColors::new(&segments[0]).shade(options.selected, true);
+        let other = PixelColors::new(&segments[1]).shade(options.selected, false);
         assert_ne!(selected, segments[0].color);
         assert!(other.r < segments[1].color.r.max(1));
 
@@ -697,8 +776,14 @@ mod tests {
             depth: 2,
             ..segments[0].clone()
         };
-        assert_eq!(shade_for(&contained, true, &options), contained.color);
-        assert_ne!(shade_for(&contained, false, &options), contained.color);
+        assert_eq!(
+            PixelColors::new(&contained).shade(options.selected, true),
+            contained.color
+        );
+        assert_ne!(
+            PixelColors::new(&contained).shade(options.selected, false),
+            contained.color
+        );
     }
 
     /// What the legend's cursor picks out is a slice of the cheese, not one arc
@@ -793,5 +878,81 @@ mod tests {
             .filter(|c| *c != ' ')
             .count();
         assert!(dots > 10, "expected outline dots, got {dots}");
+    }
+
+    #[test]
+    fn ring_segments_lookup_finds_correct_wedge() {
+        let segments = [
+            Segment {
+                id: 1,
+                depth: 1,
+                start: 0.0,
+                end: 0.25,
+                color: Rgb::new(10, 10, 10),
+                label: "a".into(),
+                size: 25,
+            },
+            Segment {
+                id: 2,
+                depth: 1,
+                start: 0.25,
+                end: 0.75,
+                color: Rgb::new(20, 20, 20),
+                label: "b".into(),
+                size: 50,
+            },
+            Segment {
+                id: 3,
+                depth: 1,
+                start: 0.75,
+                end: 1.0,
+                color: Rgb::new(30, 30, 30),
+                label: "c".into(),
+                size: 25,
+            },
+        ];
+        let ring: Vec<&Segment> = segments.iter().collect();
+        let find = |turn: f64| segment_at_turn(&ring, turn).map(|segment| segment.id);
+
+        assert_eq!(find(0.1), Some(1));
+        assert_eq!(find(0.5), Some(2));
+        assert_eq!(find(0.8), Some(3));
+        assert_eq!(find(0.25), Some(2));
+        assert_eq!(find(0.75), Some(3));
+        assert_eq!(find(1.1), None);
+    }
+
+    #[test]
+    fn ring_segments_lookup_leaves_gaps_empty() {
+        // A dropped sliver leaves a hole between siblings; the pixel in it must
+        // stay blank rather than borrow the next wedge's colour.
+        let segments = [
+            Segment {
+                id: 1,
+                depth: 1,
+                start: 0.1,
+                end: 0.25,
+                color: Rgb::new(10, 10, 10),
+                label: "a".into(),
+                size: 15,
+            },
+            Segment {
+                id: 2,
+                depth: 1,
+                start: 0.5,
+                end: 0.75,
+                color: Rgb::new(20, 20, 20),
+                label: "b".into(),
+                size: 25,
+            },
+        ];
+        let ring: Vec<&Segment> = segments.iter().collect();
+        let find = |turn: f64| segment_at_turn(&ring, turn).map(|segment| segment.id);
+
+        assert_eq!(find(0.05), None, "before the first wedge");
+        assert_eq!(find(0.3), None, "between wedges");
+        assert_eq!(find(0.9), None, "after the last wedge");
+        assert_eq!(find(0.1), Some(1));
+        assert_eq!(find(0.5), Some(2));
     }
 }

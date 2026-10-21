@@ -11,15 +11,17 @@ mod scanning;
 mod text;
 mod theme;
 
-use std::io::{Stdout, stdout};
+use std::io::{self, Write, stdout};
 use std::time::Duration;
 
 use anyhow::Result;
+use crossterm::cursor::Show;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode,
 };
+use crossterm::{execute, queue};
 use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::ListState;
 use ratatui::{Frame, Terminal};
@@ -30,11 +32,41 @@ use app::{App, View};
 /// the scan progress looks live, slow enough to stay idle when nothing moves.
 const FRAME: Duration = Duration::from_millis(120);
 
+type TuiTerminal = Terminal<CrosstermBackend<FrameWriter>>;
+
+/// Collect cell commands before touching stdout. Discard them during unwinding
+/// so terminal cleanup cannot repaint after the hook restores the shell.
+#[derive(Default)]
+struct FrameWriter {
+    pending: Vec<u8>,
+}
+
+impl Write for FrameWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.pending.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // Ratatui's drop restores the cursor by flushing its backend.
+        if std::thread::panicking() {
+            self.pending.clear();
+            return Ok(());
+        }
+        let mut out = stdout().lock();
+        let result = out.write_all(&self.pending).and_then(|()| out.flush());
+        // A failed write may have sent a prefix; never replay it on cleanup.
+        self.pending.clear();
+        result
+    }
+}
+
 /// Widget state that belongs to the screen rather than the app.
 #[derive(Default)]
 struct Ui {
     list: ListState,
     picker: ListState,
+    chart: explorer::ChartCache,
 }
 
 pub fn run(mut app: App) -> Result<()> {
@@ -44,30 +76,36 @@ pub fn run(mut app: App) -> Result<()> {
     result
 }
 
-fn enter() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+fn enter() -> Result<TuiTerminal> {
     // Without this a panic leaves the user in raw mode on the alternate
     // screen, with no echo and no prompt.
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen);
+        let _ = execute!(stdout(), EndSynchronizedUpdate, LeaveAlternateScreen, Show);
         previous(info);
     }));
 
     enable_raw_mode()?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen)?;
-    Ok(Terminal::new(CrosstermBackend::new(out))?)
+    Ok(Terminal::new(
+        CrosstermBackend::new(FrameWriter::default()),
+    )?)
 }
 
-fn leave(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+fn leave(terminal: &mut TuiTerminal) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        EndSynchronizedUpdate,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
 
-fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+fn event_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
     let mut ui = Ui::default();
     let mut tick = 0usize;
 
@@ -76,7 +114,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
         app.poll_delete();
         app.tick_watch();
         app.advance();
-        terminal.draw(|frame| draw(frame, app, &mut ui, tick))?;
+        draw_frame(terminal, app, &mut ui, tick)?;
 
         // A held-down arrow key repeats faster than a frame of a large
         // directory takes to draw. Taking the whole queue rather than one key
@@ -102,13 +140,26 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
     }
 }
 
+fn draw_frame(terminal: &mut TuiTerminal, app: &mut App, ui: &mut Ui, tick: usize) -> Result<()> {
+    // Buffering reduces writes; synchronization keeps the terminal from showing
+    // part of a frame while it consumes those bytes.
+    queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let drawn = terminal
+        .draw(|frame| draw(frame, app, ui, tick))
+        .map(|_| ());
+    let ended = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    drawn?;
+    ended?;
+    Ok(())
+}
+
 fn draw(frame: &mut Frame, app: &mut App, ui: &mut Ui, tick: usize) {
     let area = frame.area();
     match app.view {
         View::Picker => picker::draw(frame, area, app, &mut ui.picker),
         View::Scanning => scanning::draw(frame, area, app, tick),
         View::Overview => overview::draw(frame, area, app, &mut ui.list),
-        View::Explorer => explorer::draw(frame, area, app),
+        View::Explorer => explorer::draw(frame, area, app, &mut ui.chart),
     }
     if app.details {
         details::draw(frame, area, app);
@@ -345,6 +396,37 @@ mod tests {
         app.tree = Some(root);
         app.view = View::Overview;
         app
+    }
+
+    /// The explorer keeps its chart between frames and only reshades it when
+    /// the selection moves. Whatever it reuses, each frame must match one drawn
+    /// from scratch.
+    #[test]
+    fn a_kept_chart_draws_what_a_fresh_one_would() {
+        fn frame(app: &mut App, ui: &mut Ui, width: u16, height: u16) -> ratatui::buffer::Buffer {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, app, ui, 0)).unwrap();
+            terminal.backend().buffer().clone()
+        }
+
+        let mut app = test_app();
+        app.view = View::Explorer;
+        let mut kept = Ui::default();
+        let mut check = |app: &mut App, width, height, what: &str| {
+            let reused = frame(app, &mut kept, width, height);
+            let fresh = frame(app, &mut Ui::default(), width, height);
+            assert_eq!(reused, fresh, "{what}");
+        };
+
+        check(&mut app, 100, 30, "first frame");
+        app.move_selection(1);
+        check(&mut app, 100, 30, "selection moved");
+        check(&mut app, 80, 24, "terminal resized");
+        app.move_selection(-1);
+        app.open_selected();
+        assert_eq!(app.cwd, PathBuf::from("/root/big"));
+        check(&mut app, 80, 24, "another folder");
     }
 
     #[test]
