@@ -12,7 +12,7 @@ use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
 use crate::model::{self, Row};
 use crate::report::signed;
-use crate::tui::app::App;
+use crate::tui::app::{App, Listing};
 use crate::tui::text::{fit, width};
 use crate::tui::theme;
 
@@ -25,7 +25,7 @@ const BAR_MAX_WIDTH: usize = 32;
 /// Four is enough to point somewhere without becoming a second ranked list.
 const LARGEST_ITEMS: usize = 4;
 
-pub fn draw(frame: &mut Frame, area: Rect, app: &App, list_state: &mut ListState) {
+pub fn draw(frame: &mut Frame, area: Rect, app: &App, list_state: &mut ListState, tick: usize) {
     let rows = app.rows();
     let (list_height, largest_height) = split_body(app, area, rows.len());
 
@@ -44,13 +44,12 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, list_state: &mut ListState
     .split(area);
 
     draw_capacity(frame, chunks[0], chunks[1], app);
-    draw_current_folder(frame, chunks[3], app);
-    draw_totals_warning(frame, chunks[4], app);
-    draw_rows(frame, chunks[5], app, &rows, list_state);
+    draw_current_folder(frame, chunks[3], app, tick);
+    draw_rows(frame, chunks[5], app, &rows, list_state, tick);
     if largest_height > 0 {
         draw_largest(frame, chunks[6], app);
     }
-    crate::tui::footer::draw(frame, chunks[8], app, None);
+    crate::tui::footer::draw(frame, chunks[8], app, tick);
 }
 
 /// Divide the space between the header and the footer.
@@ -68,7 +67,9 @@ fn split_body(app: &App, area: Rect, row_count: usize) -> (u16, u16) {
         return (0, 0);
     }
 
-    let wanted = row_count.max(1);
+    // The line saying what a partly listed folder does not list yet is drawn
+    // inside the list's area, so it needs a line of its own there.
+    let wanted = row_count.max(1) + usize::from(app.cwd_unlisted().is_some());
     let largest_available = body.saturating_sub(wanted);
     let largest = if largest_available >= LARGEST_MIN
         && app.current_entry().is_some()
@@ -132,49 +133,33 @@ fn draw_capacity(frame: &mut Frame, name_area: Rect, bar_area: Rect, app: &App) 
     );
 }
 
-/// On a row of its own, under the line whose numbers it is about, so that no
-/// path is long enough to push either one off the screen.
-pub fn draw_totals_warning(frame: &mut Frame, area: Rect, app: &App) {
-    if app.totals_may_be_off() {
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                "totals may be off — press r",
-                theme::warning(),
-            )),
-            area,
-        );
-    }
-}
-
 /// And this line always describes the directory, so the two numbers can never
 /// be mistaken for each other.
-fn draw_current_folder(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_current_folder(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     let Some(entry) = app.current_entry() else {
         return;
     };
     let unit = app.settings.unit;
+    let total = area.width as usize;
+    if total < 8 {
+        return;
+    }
 
-    let mut spans = vec![
-        Span::styled("Current folder: ", theme::muted()),
-        Span::raw(model::display_path(&app.cwd)),
-        Span::raw("    "),
-        Span::styled(
-            format(entry.size(app.settings.size_kind), unit),
-            theme::accent(),
-        ),
-    ];
+    let prefix = "Current folder: ";
+    let size_str = format!("    {}", format(entry.size(app.settings.size_kind), unit));
+    let left_fixed_width = crate::tui::text::width(prefix) + crate::tui::text::width(&size_str);
 
-    // When growth is on screen, say how much and over what period — a column
-    // of "+2 GB" means nothing without knowing whether that was an hour or a
-    // month.
+    let mut growth_span = None;
+    let mut growth_width = 0;
     if let (true, Some(diff)) = (app.showing_growth(), &app.diff) {
-        spans.push(Span::raw("    "));
-        spans.push(Span::styled(
-            format!(
-                "{} in {}",
-                signed(diff.total_delta(), unit),
-                crate::timefmt::humanize(diff.elapsed())
-            ),
+        let diff_str = format!(
+            "    {} in {}",
+            signed(diff.total_delta(), unit),
+            crate::timefmt::humanize(diff.elapsed())
+        );
+        growth_width = crate::tui::text::width(&diff_str);
+        growth_span = Some(Span::styled(
+            diff_str,
             Style::default().fg(theme::color(palette::growth_color(
                 diff.total_delta(),
                 diff.total_delta().abs().max(1),
@@ -182,18 +167,61 @@ fn draw_current_folder(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
-    // Numbers from a snapshot are real, just old. Saying so is the whole
-    // difference between showing them and misleading with them.
-    if let Some(taken_at) = app.provisional {
+    let mut right_span = None;
+    let mut right_width = 0;
+
+    if let Some(taken_at) = app.provisional_for_cwd() {
         let age = disko_core::history::now().saturating_sub(taken_at);
-        spans.push(Span::raw("    "));
-        spans.push(Span::styled(
-            format!("as of {} · rescanning…", crate::timefmt::ago(age)),
-            theme::warning(),
-        ));
+        let rescan_str = format!(
+            "as of {} · {} rescanning…",
+            crate::timefmt::ago(age),
+            theme::spinner(tick)
+        );
+        right_width = crate::tui::text::width(&rescan_str);
+        right_span = Some(Span::styled(rescan_str, theme::warning()));
+    } else if app.cwd_is_being_scanned() {
+        // A refresh keeps the old numbers on screen until it lands; say so,
+        // even when the footer is busy reporting a deletion.
+        let rescan_str = format!("{} rescanning…", theme::spinner(tick));
+        right_width = crate::tui::text::width(&rescan_str);
+        right_span = Some(Span::styled(rescan_str, theme::warning()));
     } else if let Some(note) = incomplete_note(entry) {
-        spans.push(Span::raw("    "));
-        spans.push(Span::styled(note, theme::warning()));
+        let note_str = note;
+        right_width = crate::tui::text::width(&note_str);
+        right_span = Some(Span::styled(note_str, theme::warning()));
+    }
+
+    let gap = if right_span.is_some() { 2 } else { 0 };
+    let path_budget = total.saturating_sub(left_fixed_width + growth_width + right_width + gap);
+    let display_p = model::display_path(&app.cwd);
+    let path_text = if crate::tui::text::width(&display_p) <= path_budget {
+        display_p
+    } else if path_budget >= 6 {
+        crate::tui::text::shorten_path(&display_p, path_budget)
+    } else {
+        crate::tui::text::truncate(&display_p, path_budget.max(1))
+    };
+
+    let path_width = crate::tui::text::width(&path_text);
+    let left_width = crate::tui::text::width(prefix)
+        + path_width
+        + crate::tui::text::width(&size_str)
+        + growth_width;
+    let padding = total.saturating_sub(left_width + right_width);
+
+    let mut spans = vec![
+        Span::styled(prefix, theme::muted()),
+        Span::raw(path_text),
+        Span::styled(size_str, theme::accent()),
+    ];
+    if let Some(g) = growth_span {
+        spans.push(g);
+    }
+    if let Some(r) = right_span {
+        if padding > 0 {
+            spans.push(Span::raw(" ".repeat(padding)));
+        }
+        spans.push(r);
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -201,7 +229,7 @@ fn draw_current_folder(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Says so out loud when the numbers are a floor rather than a total.
 fn incomplete_note(entry: &DiskEntry) -> Option<String> {
-    match entry.scan_state {
+    match entry.scan_state() {
         ScanState::Complete => None,
         ScanState::Denied => Some("unreadable".to_string()),
         ScanState::Cancelled => Some("scan cancelled — sizes incomplete".to_string()),
@@ -210,17 +238,37 @@ fn incomplete_note(entry: &DiskEntry) -> Option<String> {
     }
 }
 
-fn draw_rows(frame: &mut Frame, area: Rect, app: &App, rows: &[Row], list_state: &mut ListState) {
+fn draw_rows(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    rows: &[Row],
+    list_state: &mut ListState,
+    tick: usize,
+) {
     if rows.is_empty() {
-        let message = if app.search.is_some() {
-            "nothing matches that search"
-        } else if app.showing_growth() {
-            "nothing here changed"
-        } else {
-            "this folder is empty"
-        };
+        let message = no_rows_message(app, tick);
+        let message = crate::tui::text::truncate(&message, area.width as usize);
         frame.render_widget(Paragraph::new(Span::styled(message, theme::muted())), area);
         return;
+    }
+
+    // The bottom line, kept clear of the rows so it shows however long the
+    // list is.
+    let mut area = area;
+    if area.height >= 2
+        && let Some(line) = unlisted_line(app, tick, area.width as usize)
+    {
+        area.height -= 1;
+        let line_area = Rect {
+            y: area.y + area.height,
+            height: 1,
+            ..area
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(line, theme::warning())),
+            line_area,
+        );
     }
 
     let unit = app.settings.unit;
@@ -320,18 +368,108 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &App, rows: &[Row], list_state:
     );
 }
 
+/// The line under a folder's rows when they are not all it holds: how much
+/// is missing, and whether it is on its way. Without it, entries the running
+/// scan adds later appear out of nowhere above rows that looked complete.
+/// Shared by the list here and the explorer's legend: the longest wording
+/// that fits `max_width` wins, dropping detail before the action to take.
+pub(crate) fn unlisted_line(app: &App, tick: usize, max_width: usize) -> Option<String> {
+    let (items, bytes) = app.cwd_unlisted()?;
+    let spinner = theme::spinner(tick);
+    let count = crate::output::count(items);
+    let size = format(bytes, app.settings.unit);
+    let candidates: Vec<String> = if app.cwd_is_being_scanned() && app.cwd_focus_refused() {
+        // Nothing counts this folder ahead of the rest.
+        let mut candidates = Vec::new();
+        if items > 0 {
+            candidates.push(format!(
+                "{spinner} {count} more · {size} — waiting for the full scan"
+            ));
+            candidates.push(format!(
+                "{spinner} {count} more — waiting for the full scan"
+            ));
+        }
+        candidates.push(format!("{spinner} waiting for the full scan"));
+        candidates
+    } else if app.cwd_is_being_scanned() {
+        if items == 0 {
+            vec![format!("{spinner} counting the rest…")]
+        } else {
+            vec![
+                format!("{spinner} counting {count} more · {size}…"),
+                format!("{spinner} counting {count} more…"),
+                format!("{spinner} counting the rest…"),
+            ]
+        }
+    } else {
+        // `r` waits for a scan elsewhere.
+        let action = if app.progress().is_some() {
+            "r after scan"
+        } else {
+            "press r"
+        };
+        let mut candidates = Vec::new();
+        if items > 0 {
+            candidates.push(format!("+ {count} more · {size} not listed — {action}"));
+            candidates.push(format!("+{count} · {size} unlisted — {action}"));
+            candidates.push(format!("+{count} unlisted — {action}"));
+        }
+        candidates.push(format!("not all listed — {action}"));
+        candidates
+    };
+    let fits = |text: &&String| crate::tui::text::width(text) <= max_width;
+    let chosen = candidates.iter().find(fits).or(candidates.last())?;
+    Some(crate::tui::text::truncate(chosen, max_width))
+}
+
+/// What to say when the current folder has no rows to show. Shared by the
+/// list here and the explorer's legend, so the two never disagree; every
+/// message fits the legend's 34 columns.
+pub(crate) fn no_rows_message(app: &App, tick: usize) -> String {
+    // `/` opens an empty query, which matches everything: until something is
+    // typed, no rows says nothing about the search.
+    if app.search.as_deref().is_some_and(|query| !query.is_empty()) {
+        // In a folder not fully listed yet, a match may still be on its way;
+        // past `--depth` nothing below was kept to search.
+        return match app.cwd_listing() {
+            Listing::Complete => "nothing matches that search".to_string(),
+            Listing::Short => "nothing listed matches yet".to_string(),
+            Listing::BeyondDepth => "nothing listed — beyond --depth".to_string(),
+        };
+    }
+    if app.showing_growth() {
+        return "nothing here changed".to_string();
+    }
+    match app.cwd_listing() {
+        // Nothing is missing, so no scan will add anything: say so now
+        // rather than spin for as long as the whole scan takes.
+        Listing::Complete => "this folder is empty".to_string(),
+        // The run's own root: running disko here is what was just done.
+        Listing::BeyondDepth if app.cwd == app.root => "beyond --depth".to_string(),
+        Listing::BeyondDepth => "beyond --depth — run disko here".to_string(),
+        Listing::Short if app.cwd_is_being_scanned() && app.cwd_focus_refused() => {
+            format!("{} waiting for the full scan…", theme::spinner(tick))
+        }
+        Listing::Short if app.cwd_is_being_scanned() => {
+            format!("{} scanning this folder…", theme::spinner(tick))
+        }
+        // A scan elsewhere is running, and `r` waits for it.
+        Listing::Short if app.progress().is_some() => {
+            "not fully counted — r after scan".to_string()
+        }
+        Listing::Short => "not fully counted — press r".to_string(),
+    }
+}
+
 fn draw_largest(frame: &mut Frame, area: Rect, app: &App) {
     // In growth mode the ranked list already answers "where should I look
     // next"; a second list of merely-large things would compete with it.
     if app.showing_growth() {
         return;
     }
-    let Some(entry) = app.current_entry() else {
-        return;
-    };
     // One line goes to the blank separator and one to the heading.
     let count = (area.height as usize).saturating_sub(2);
-    let items = model::largest_items(&app.cwd, entry, count, app.settings.size_kind);
+    let items = app.largest_items(count);
     if items.is_empty() {
         return;
     }
@@ -339,7 +477,7 @@ fn draw_largest(frame: &mut Frame, area: Rect, app: &App) {
     let unit = app.settings.unit;
     let size_width = items
         .iter()
-        .map(|(_, item)| width(&format(item.size(app.settings.size_kind), unit)))
+        .map(|(_, size)| width(&format(*size, unit)))
         .max()
         .unwrap_or(8);
 
@@ -347,14 +485,11 @@ fn draw_largest(frame: &mut Frame, area: Rect, app: &App) {
         Line::default(),
         Line::from(Span::styled("Largest items", theme::muted())),
     ];
-    lines.extend(items.iter().map(|(path, item)| {
+    lines.extend(items.iter().map(|(path, size)| {
         Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                format!(
-                    "{:>size_width$}",
-                    format(item.size(app.settings.size_kind), unit)
-                ),
+                format!("{:>size_width$}", format(*size, unit)),
                 theme::heading(),
             ),
             Span::raw("   "),
@@ -373,7 +508,7 @@ mod tests {
     #[test]
     fn skipped_entries_use_a_reason_valid_for_every_mount_kind() {
         let mut entry = DiskEntry::new("mounted", EntryType::Directory);
-        entry.scan_state = ScanState::Skipped;
+        entry.set_scan_state(ScanState::Skipped);
 
         assert_eq!(
             incomplete_note(&entry).as_deref(),

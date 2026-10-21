@@ -11,8 +11,6 @@ use crate::tui::app::App;
 use crate::tui::text::shorten_path;
 use crate::tui::theme;
 
-const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
 pub fn draw(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     let chunks = Layout::vertical([
         Constraint::Length(2),
@@ -23,7 +21,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     .horizontal_margin(1)
     .split(area);
 
-    let spinner = SPINNER[tick % SPINNER.len()];
+    let spinner = theme::spinner(tick);
     let mut lines = vec![Line::from(vec![
         Span::styled(format!("{spinner} "), theme::accent()),
         Span::styled("Scanning ", theme::heading()),
@@ -69,7 +67,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
         chunks[1],
     );
     draw_found(frame, chunks[2], app);
-    crate::tui::footer::draw(frame, chunks[3], app, None);
+    crate::tui::footer::draw(frame, chunks[3], app, tick);
 }
 
 /// The biggest things counted so far.

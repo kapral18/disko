@@ -84,7 +84,7 @@ impl Row {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowOptions {
     pub size_kind: SizeKind,
     /// Cap the list, folding everything past it into "Other".

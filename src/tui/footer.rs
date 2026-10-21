@@ -21,10 +21,7 @@ const QUIT: Hint = ("q", "quit");
 
 const GAP: usize = 3;
 
-/// `note` is what the screen above wants said in the right-hand slot when it
-/// has nothing more urgent to report — the explorer uses it to admit when the
-/// selected wedge is too small to place.
-pub fn draw(frame: &mut Frame, area: Rect, app: &App, note: Option<String>) {
+pub fn draw(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     if app.search_active {
         draw_search(frame, area, app);
         return;
@@ -35,7 +32,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, note: Option<String>) {
     // The status earns its place only if there is room left after the keys.
     let room_for_status = total.saturating_sub(minimum_width(app) + GAP);
     let right = if room_for_status >= 8 {
-        truncate(&status(app, note), room_for_status)
+        truncate(&status(app, tick), room_for_status)
     } else {
         String::new()
     };
@@ -55,6 +52,10 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, note: Option<String>) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Shown in Overview/Explorer only while a background scan (`r`, `R`, or the
+/// automatic rescan after a drifted deletion) is actually running.
+const STOP_SCAN: Hint = ("z", "stop scan");
+
 /// Fit as many hints as the width allows, dropping the least important first
 /// but never the one that says how to get out.
 fn hint_spans(app: &App, budget: usize) -> Vec<Span<'static>> {
@@ -64,8 +65,8 @@ fn hint_spans(app: &App, budget: usize) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0;
 
-    for hint in hints_for(app.view) {
-        let needed = hint_width(*hint) + if spans.is_empty() { 0 } else { GAP };
+    for hint in hints_for(app) {
+        let needed = hint_width(hint) + if spans.is_empty() { 0 } else { GAP };
         // Leave room for the escape hatch, always.
         if used + needed + GAP + quit_width > budget {
             break;
@@ -74,8 +75,8 @@ fn hint_spans(app: &App, budget: usize) -> Vec<Span<'static>> {
             spans.push(Span::raw(" ".repeat(GAP)));
             used += GAP;
         }
-        spans.extend(render(*hint));
-        used += hint_width(*hint);
+        spans.extend(render(hint));
+        used += hint_width(hint);
     }
 
     if !spans.is_empty() {
@@ -100,7 +101,7 @@ fn hint_width(hint: Hint) -> usize {
 /// The narrowest the keys can get: one hint plus the way out.
 fn minimum_width(app: &App) -> usize {
     let quit = hint_width(quit_hint(app));
-    match hints_for(app.view).first() {
+    match hints_for(app).first() {
         Some(first) => hint_width(*first) + GAP + quit,
         None => quit,
     }
@@ -114,9 +115,9 @@ fn quit_hint(app: &App) -> Hint {
 }
 
 /// Most useful first: the tail is what gets dropped on a narrow terminal.
-fn hints_for(view: View) -> &'static [Hint] {
-    match view {
-        View::Overview => &[
+fn hints_for(app: &App) -> Vec<Hint> {
+    let mut hints: Vec<Hint> = match app.view {
+        View::Overview => vec![
             ("Tab", "chart"),
             ("l/→", "open"),
             ("h/←", "up"),
@@ -128,7 +129,7 @@ fn hints_for(view: View) -> &'static [Hint] {
             ("/", "search"),
             ("d", "details"),
         ],
-        View::Explorer => &[
+        View::Explorer => vec![
             ("Tab", "list"),
             ("Enter", "open"),
             ("h/←", "up"),
@@ -138,13 +139,24 @@ fn hints_for(view: View) -> &'static [Hint] {
             ("o", "reveal"),
             ("y", "copy"),
         ],
-        View::Picker => &[("↑↓", "select"), ("Enter", "scan")],
-        View::Scanning => &[],
+        View::Picker => vec![("↑↓", "select"), ("Enter", "scan")],
+        View::Scanning => vec![],
+    };
+    // Only worth a key hint while there is something to stop; browsing is the
+    // normal case and a background scan is the exception. `z` is refused
+    // outright while the screen is still painted from a snapshot rather than
+    // the scan in progress, so the hint stays hidden for the same stretch.
+    if matches!(app.view, View::Overview | View::Explorer)
+        && app.progress().is_some()
+        && app.provisional.is_none()
+    {
+        hints.insert(2, STOP_SCAN);
     }
+    hints
 }
 
 /// The right-hand slot shows the most useful thing available.
-fn status(app: &App, note: Option<String>) -> String {
+fn status(app: &App, tick: usize) -> String {
     if !app.marks.is_empty() {
         format!(
             "{} marked · {}",
@@ -153,8 +165,22 @@ fn status(app: &App, note: Option<String>) -> String {
         )
     } else if let Some(status) = &app.status {
         status.clone()
-    } else if let Some(note) = note {
-        note
+    } else if let Some(progress) = app.progress() {
+        // Only a subtree scan names its folder; the header already names the
+        // root, and the key hints need the room more than a repeated path does.
+        let folder = app
+            .scanned_path()
+            .filter(|scanned| *scanned != app.root)
+            .and_then(|scanned| scanned.file_name())
+            .map(|name| format!(" {} ·", name.to_string_lossy()))
+            .unwrap_or_default();
+        format!(
+            "{} scanning{} {} items · {}",
+            theme::spinner(tick),
+            folder,
+            progress.entries(),
+            format(progress.bytes(), app.settings.unit)
+        )
     } else if let Some(watch) = &app.watch {
         format!(
             "watching · every {}s · {}",

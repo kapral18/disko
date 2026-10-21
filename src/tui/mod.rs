@@ -13,7 +13,7 @@ mod text;
 mod theme;
 
 use std::io::{self, Write, stdout};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::cursor::Show;
@@ -33,6 +33,9 @@ use preferences::BrowseView;
 /// How long a frame waits for input before redrawing anyway. Fast enough that
 /// the scan progress looks live, slow enough to stay idle when nothing moves.
 const FRAME: Duration = Duration::from_millis(120);
+
+/// A stream of ready keys must still yield to drawing and scan polling.
+const INPUT_BUDGET: Duration = Duration::from_millis(8);
 
 type TuiTerminal = Terminal<CrosstermBackend<FrameWriter>>;
 
@@ -80,10 +83,14 @@ pub fn run(mut app: App) -> Result<()> {
     apply_saved_view(&mut app, saved_view);
     let mut terminal = enter()?;
     let result = event_loop(&mut terminal, &mut app);
+    let browsing_view = app.browsing_view;
+    // The process is about to exit, which hands the memory back at once;
+    // freeing a whole-disk tree entry by entry would keep the shell waiting.
+    std::mem::forget(app);
     leave(&mut terminal)?;
-    if app.browsing_view != saved_view
+    if browsing_view != saved_view
         && let Some(path) = preference_path
-        && let Err(error) = preferences::save(&path, app.browsing_view)
+        && let Err(error) = preferences::save(&path, browsing_view)
     {
         eprintln!("disko: could not save the view preference: {error}");
     }
@@ -126,21 +133,21 @@ fn event_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
     loop {
         app.poll_scan();
         app.poll_delete();
+        app.poll_filesystems();
         app.tick_watch();
         app.advance();
         draw_frame(terminal, app, &mut ui, tick)?;
 
-        // A held-down arrow key repeats faster than a frame of a large
-        // directory takes to draw. Taking the whole queue rather than one key
-        // per frame keeps the cursor level with the keyboard, instead of
-        // building a backlog that carries on scrolling after the key is up.
+        // Batch ready keys, but yield while input is still arriving so a
+        // sustained burst cannot postpone every redraw until it stops.
         if event::poll(FRAME)? {
+            let started = Instant::now();
             loop {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, key),
                     _ => {}
                 }
-                if app.quit || !event::poll(Duration::ZERO)? {
+                if app.quit || started.elapsed() >= INPUT_BUDGET || !event::poll(Duration::ZERO)? {
                     break;
                 }
             }
@@ -148,6 +155,17 @@ fn event_loop(terminal: &mut TuiTerminal, app: &mut App) -> Result<()> {
 
         tick = tick.wrapping_add(1);
         if app.quit {
+            // A scan that has counted everything may still be writing its
+            // snapshot; say why the screen waits rather than look hung. Marks
+            // or the search box would take the footer's place, and the
+            // process is leaving them.
+            if app.saving() {
+                app.marks.clear();
+                app.search_active = false;
+                app.status = Some("saving this scan… (q again to skip)".into());
+                let _ = draw_frame(terminal, app, &mut ui, tick);
+                while app.saving() && !quit_again() {}
+            }
             app.cancel_scan();
             return Ok(());
         }
@@ -167,16 +185,37 @@ fn draw_frame(terminal: &mut TuiTerminal, app: &mut App, ui: &mut Ui, tick: usiz
     Ok(())
 }
 
+/// Wait a moment for a key that says not to wait any longer: `q` or Ctrl-C.
+/// A terminal that cannot be read any more ends the wait too, rather than
+/// spin on it.
+fn quit_again() -> bool {
+    match event::poll(Duration::from_millis(5)) {
+        Ok(false) => return false,
+        Ok(true) => {}
+        Err(_) => return true,
+    }
+    match event::read() {
+        Ok(Event::Key(key)) => {
+            key.kind == KeyEventKind::Press
+                && (key.code == KeyCode::Char('q')
+                    || (key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)))
+        }
+        Ok(_) => false,
+        Err(_) => true,
+    }
+}
+
 fn draw(frame: &mut Frame, app: &mut App, ui: &mut Ui, tick: usize) {
     let area = frame.area();
     match app.view {
         View::Picker => picker::draw(frame, area, app, &mut ui.picker),
         View::Scanning => scanning::draw(frame, area, app, tick),
-        View::Overview => overview::draw(frame, area, app, &mut ui.list),
-        View::Explorer => explorer::draw(frame, area, app, &mut ui.chart),
+        View::Overview => overview::draw(frame, area, app, &mut ui.list, tick),
+        View::Explorer => explorer::draw(frame, area, app, &mut ui.chart, tick),
     }
     if app.details {
-        details::draw(frame, area, app);
+        details::draw(frame, area, app, tick);
     }
     // The confirmation sits above everything, including the details panel.
     if let Some(pending) = app.confirm.clone() {
@@ -312,8 +351,14 @@ fn handle_scanning(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Esc => {
-            app.cancel_scan();
-            app.status = Some("stopping — showing what was counted so far".into());
+            // Once the scan has counted everything there is no partial
+            // count to stop at; it is only being compared.
+            app.status = Some(if app.scan_counted() {
+                app::FINISHING.into()
+            } else {
+                app.cancel_scan();
+                "stopping — showing what was counted so far".into()
+            });
         }
         _ => {}
     }
@@ -370,6 +415,8 @@ fn handle_browsing(app: &mut App, key: KeyEvent) {
         KeyCode::Char(' ') => app.toggle_mark(),
         KeyCode::Char('x') | KeyCode::Delete => app.request_delete(),
         KeyCode::Char('r') => app.rescan(),
+        KeyCode::Char('R') => app.rescan_root(),
+        KeyCode::Char('z') => app.cancel_background_scan(),
         _ => {}
     }
 }

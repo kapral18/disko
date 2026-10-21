@@ -5,14 +5,14 @@ use std::io::Write;
 
 use anyhow::Result;
 use disko_core::size::{format, format_percent, format_percent_whole};
-use disko_core::{DiskEntry, Filesystem, Unit};
+use disko_core::{DiskEntry, Filesystem, PublicTree, Unit};
 use serde::Serialize;
 
 use crate::model::{self, RowOptions};
 
 #[derive(Serialize)]
 struct ScanReport<'a> {
-    root: &'a DiskEntry,
+    root: PublicTree<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     filesystem: Option<&'a Filesystem>,
 }
@@ -22,7 +22,10 @@ pub fn scan_json(
     root: &DiskEntry,
     filesystem: Option<&Filesystem>,
 ) -> Result<()> {
-    let report = ScanReport { root, filesystem };
+    let report = ScanReport {
+        root: PublicTree(root),
+        filesystem,
+    };
     serde_json::to_writer_pretty(&mut *out, &report)?;
     writeln!(out)?;
     Ok(())
@@ -188,7 +191,7 @@ pub fn filesystem_details(out: &mut impl Write, fs: &Filesystem, unit: Unit) -> 
 }
 
 /// `1448344` -> `1,448,344`. Inode counts are unreadable without separators.
-fn count(value: u64) -> String {
+pub(crate) fn count(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, ch) in digits.chars().enumerate() {
@@ -319,6 +322,22 @@ mod tests {
         assert_eq!(parsed["root"]["children"][0]["path"], "/root/big");
         assert_eq!(parsed["root"]["entry_type"], "directory");
         assert!(parsed.get("filesystem").is_none());
+    }
+
+    #[test]
+    fn json_output_omits_the_private_aggregate_fields() {
+        let tree = tree();
+        let text = rendered(|out| scan_json(out, &tree, None));
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert!(parsed["root"].get("own_modified").is_none());
+        assert!(parsed["root"].get("own_scan_state").is_none());
+        assert!(parsed["root"]["children"][0].get("own_modified").is_none());
+        assert!(
+            parsed["root"]["children"][0]
+                .get("own_scan_state")
+                .is_none()
+        );
     }
 
     #[test]

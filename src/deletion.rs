@@ -98,6 +98,7 @@ pub struct DeleteProgress {
     items_total: AtomicUsize,
     files_removed: AtomicU64,
     freed: AtomicU64,
+    links_kept: AtomicU64,
     finished: AtomicBool,
     current: Mutex<PathBuf>,
 }
@@ -128,6 +129,11 @@ impl DeleteProgress {
         self.freed.load(Ordering::Relaxed)
     }
 
+    /// Files unlinked while another link still held their data.
+    fn links_kept(&self) -> u64 {
+        self.links_kept.load(Ordering::Relaxed)
+    }
+
     pub fn is_finished(&self) -> bool {
         self.finished.load(Ordering::Relaxed)
     }
@@ -156,6 +162,11 @@ impl DeleteProgress {
     fn file_removed(&self, bytes: u64) {
         self.files_removed.fetch_add(1, Ordering::Relaxed);
         self.freed.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    #[cfg(unix)]
+    fn link_kept(&self) {
+        self.links_kept.fetch_add(1, Ordering::Relaxed);
     }
 
     fn finish(&self) {
@@ -806,7 +817,7 @@ mod unix_delete {
                     };
                     match unlinkat(parent, name, AtFlags::empty()) {
                         Ok(()) => {
-                            let bytes = freed_by_unlink(&stat);
+                            let bytes = freed_by_unlink(&stat, ctx.progress);
                             ctx.record_removed(bytes);
                             return Ok(());
                         }
@@ -914,7 +925,7 @@ mod unix_delete {
         // already permitted to cross mounts on the way here.
         ensure_identity(&stat, expected_identity)?;
         unlinkat(parent, name, AtFlags::empty())?;
-        progress.file_removed(freed_by_unlink(&stat));
+        progress.file_removed(freed_by_unlink(&stat, progress));
         Ok(())
     }
 
@@ -930,10 +941,11 @@ mod unix_delete {
     }
 
     /// Bytes an unlink of `stat` freed: none while another link remains.
-    fn freed_by_unlink(stat: &Stat) -> u64 {
+    fn freed_by_unlink(stat: &Stat, progress: &DeleteProgress) -> u64 {
         if stat.st_nlink <= 1 {
             allocated_stat(stat)
         } else {
+            progress.link_kept();
             0
         }
     }
@@ -1462,6 +1474,8 @@ pub enum Outcome {
         path: PathBuf,
         freed: u64,
         tree_needs_rescan: bool,
+        /// Whether it unlinked a file another link still held.
+        links_survived: bool,
     },
     Refused {
         path: PathBuf,
@@ -1473,6 +1487,8 @@ pub enum Outcome {
         removed_bytes: u64,
         removed_entries: u64,
         tree_may_have_changed: bool,
+        /// Whether it unlinked a file another link still held.
+        links_survived: bool,
     },
 }
 
@@ -1497,6 +1513,21 @@ impl Outcome {
                     tree_may_have_changed: true,
                     ..
                 }
+        )
+    }
+
+    /// Whether this deletion unlinked a file that another link still holds.
+    /// That link can be anywhere in the tree.
+    pub fn links_survived(&self) -> bool {
+        matches!(
+            self,
+            Outcome::Deleted {
+                links_survived: true,
+                ..
+            } | Outcome::Failed {
+                links_survived: true,
+                ..
+            }
         )
     }
 
@@ -1561,6 +1592,7 @@ pub fn delete_all(
                 removed_bytes: 0,
                 removed_entries: 0,
                 tree_may_have_changed: false,
+                links_survived: false,
             })
             .collect();
         progress.finish();
@@ -1579,6 +1611,7 @@ pub fn delete_all(
 
         progress.start_item(&target.path);
         let files_before = progress.files_removed();
+        let links_before = progress.links_kept();
         let bytes_before = progress.freed();
         let outcome = match check(&target.path, root) {
             Err(reason) => Outcome::Refused {
@@ -1602,6 +1635,7 @@ pub fn delete_all(
                         path: target.path.clone(),
                         freed,
                         tree_needs_rescan: freed != target.allocated_size,
+                        links_survived: progress.links_kept() > links_before,
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Outcome::Failed {
@@ -1611,6 +1645,7 @@ pub fn delete_all(
                     removed_entries: progress.files_removed().saturating_sub(files_before),
                     tree_may_have_changed: progress.files_removed() > files_before
                         || cfg!(not(unix)) && target.is_dir,
+                    links_survived: progress.links_kept() > links_before,
                 },
                 Err(error) => Outcome::Failed {
                     path: target.path.clone(),
@@ -1619,6 +1654,7 @@ pub fn delete_all(
                     removed_entries: progress.files_removed().saturating_sub(files_before),
                     tree_may_have_changed: progress.files_removed() > files_before
                         || cfg!(not(unix)) && target.is_dir,
+                    links_survived: progress.links_kept() > links_before,
                 },
             },
         };
@@ -2258,6 +2294,63 @@ mod tests {
             "the scan credited the file to the target, so freeing less must be flagged"
         );
         assert!(survivor.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_completed_deletion_reports_a_link_left_elsewhere() {
+        let temp = TempTree::new("hardlink-credited-elsewhere");
+        let victim = temp.dir("victim");
+        let inside = temp.file("victim/file.bin", 10_000);
+        std::fs::hard_link(&inside, temp.0.join("survivor.bin")).unwrap();
+        let directory_bytes = allocated_of(&std::fs::symlink_metadata(&victim).unwrap());
+
+        // The scan credited the file to the link outside the target.
+        let outcomes = run(
+            &[Target {
+                path: victim,
+                size: directory_bytes,
+                allocated_size: directory_bytes,
+                filesystem_identity: None,
+                is_dir: true,
+            }],
+            &temp.0,
+        );
+
+        assert!(outcomes[0].succeeded());
+        assert!(
+            !outcomes[0].needs_rescan(),
+            "the tree already credits the surviving link, so nothing needs a rescan"
+        );
+        assert!(outcomes[0].links_survived());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_deletion_reports_a_link_it_left_elsewhere() {
+        let temp = TempTree::new("hardlink-failed");
+        let victim = temp.dir("victim");
+        // Both files keep a link outside, so whichever goes first leaves one.
+        for name in ["first.bin", "second.bin"] {
+            let inside = temp.file(&format!("victim/{name}"), 4096);
+            std::fs::hard_link(&inside, temp.0.join(name)).unwrap();
+        }
+
+        unix_delete::FAILURE_AFTER_ENTRIES.set(Some(1));
+        let outcomes = run(
+            &[Target {
+                path: victim,
+                size: 8192,
+                allocated_size: 8192,
+                filesystem_identity: None,
+                is_dir: true,
+            }],
+            &temp.0,
+        );
+        unix_delete::FAILURE_AFTER_ENTRIES.set(None);
+
+        assert!(!outcomes[0].succeeded());
+        assert!(outcomes[0].links_survived());
     }
 
     #[cfg(unix)]

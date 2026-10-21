@@ -247,8 +247,32 @@ It is saved when you quit, to `~/.config/disko/view`
 | `y` `c` | copy the selected path to the clipboard |
 | `Space` | mark an entry; the footer totals what you marked |
 | **`x`** | **delete what is marked** (or the selection), after confirmation |
-| `r` | rescan |
+| `r` | rescan current directory |
+| `R` | rescan from root |
+| `z` | stop a background rescan |
 | `q` | quit |
+
+`r`, `R`, and the automatic rescan after a deletion (below) run in the
+background, and both views stay interactive. `r` and `R` are refused while one
+runs; press `z` to stop it. A stopped folder rescan leaves the folder as it
+was, except folders you opened while it ran (below). A stopped whole-tree
+rescan shows what it counted so far, marked incomplete, with no growth
+comparison; if it never listed the folder you are in, you are moved up to the
+nearest one it did. A `z` that comes after a whole-tree rescan has finished
+counting stops nothing: disko says it is finishing, and the full result lands,
+with its comparison if there is one. Quitting right then waits until that
+scan's snapshot is saved (`q` again skips it). A folder disko did not fully
+list says so ("not fully counted — press r", or "beyond --depth" at the depth
+limit) instead of looking empty.
+
+While a scan runs you can keep going deeper than the numbers on screen
+reach: opening a folder under what it covers that is listed only in part — or
+not at all — scans that folder first, on threads of its own, and fills it in
+as soon as it is counted. The scan carries on and replaces those numbers when
+it finishes. Until a folder lists everything it holds, the line under its
+entries says how much is missing and whether it is being counted
+(`⠋ counting 1,200 more · 85 GB…`), so entries that appear later are no
+surprise.
 
 ### Deleting
 
@@ -292,9 +316,12 @@ something that has vanished since the scan. Symlinks are unlinked, never
 followed into.
 
 Totals usually correct themselves instantly, by subtracting what was removed.
-When a deletion stops part-way or frees a different amount than the scan
-counted, subtracting can't fix them, and disko says `totals may be off — press
-r` under the current folder until a rescan replaces them.
+When a deletion fails, stops part-way, or frees more than the tree expected (a
+file grew since the scan), disko rescans only the parent directory, in the
+background. When it frees less than expected, or unlinks a file that a hard
+link outside what was deleted still holds and then fails or frees a different
+amount than expected, the missing bytes could be anywhere, so disko rescans the
+whole tree. `x` is refused while that rescan runs; press `z` to stop it.
 
 `disko --read-only` removes the ability entirely.
 

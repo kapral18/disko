@@ -35,7 +35,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, list_state: &mut ListState
             )),
             chunks[2],
         );
-        crate::tui::footer::draw(frame, chunks[3], app, None);
+        crate::tui::footer::draw(frame, chunks[3], app, 0);
         return;
     }
 
@@ -89,5 +89,5 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, list_state: &mut ListState
         list_state,
     );
 
-    crate::tui::footer::draw(frame, chunks[3], app, None);
+    crate::tui::footer::draw(frame, chunks[3], app, 0);
 }

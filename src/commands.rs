@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use disko_core::categories::{self, Group};
-use disko_core::history::{self, Store};
+use disko_core::history::{self, Snapshot, SnapshotId, Store};
 use disko_core::scan::{self, Cancel, Progress};
-use disko_core::{Diff, DiskEntry, SizeKind};
+use disko_core::{Diff, DiskEntry, PublicTree, SizeKind};
+use serde::Serialize;
 
 use crate::cli::Options;
 use crate::model::display_path;
@@ -264,7 +265,8 @@ pub fn history(
     let snapshots = store.load_all(&root);
 
     if options.json {
-        serde_json::to_writer_pretty(&mut *out, &snapshots)?;
+        let public: Vec<PublicSnapshot> = snapshots.iter().map(PublicSnapshot::from).collect();
+        serde_json::to_writer_pretty(&mut *out, &public)?;
         writeln!(out)?;
         return Ok(());
     }
@@ -279,34 +281,75 @@ pub fn history(
     )
 }
 
+/// A [`Snapshot`], for `history --json`: its tree goes through [`PublicTree`].
+#[derive(Serialize)]
+struct PublicSnapshot<'a> {
+    root: &'a Path,
+    taken_at: u64,
+    total_allocated: u64,
+    total_apparent: u64,
+    items: u64,
+    floor: u64,
+    tree: PublicTree<'a>,
+}
+
+impl<'a> From<&'a Snapshot> for PublicSnapshot<'a> {
+    fn from(snapshot: &'a Snapshot) -> Self {
+        Self {
+            root: &snapshot.root,
+            taken_at: snapshot.taken_at,
+            total_allocated: snapshot.total_allocated,
+            total_apparent: snapshot.total_apparent,
+            items: snapshot.items,
+            floor: snapshot.floor,
+            tree: PublicTree(&snapshot.tree),
+        }
+    }
+}
+
 /// The last thing disko knew about `path`, for painting a screen before the
 /// fresh scan has finished.
 pub fn last_snapshot(path: &Path) -> Option<disko_core::Snapshot> {
     Store::open().ok()?.latest(path)
 }
 
-/// Compare a fresh scan against the last snapshot, then record it.
+/// Store `tree` as the newest snapshot of its root (when `record`), and hand
+/// back the store with the one that was newest before it, which a comparison
+/// needs.
 ///
-/// Order matters: recording first would leave the newest snapshot equal to the
-/// scan being compared, and every diff would come back empty.
-pub fn record_and_diff(tree: &DiskEntry, kind: SizeKind, record: bool) -> Option<Diff> {
-    let store = Store::open().ok()?;
-    let now = history::now();
-    let previous = store.latest(tree.root_path());
+/// Only the old one's name is read before writing — the other way round, the
+/// newest snapshot would be the scan itself and every comparison against it
+/// would come back empty. Parsing it can wait until the new one is safe, which
+/// is also why this one is never written over it: a scan recorded within the
+/// same second as the last gets the next second.
+pub fn record_snapshot(tree: &DiskEntry, record: bool) -> Option<(Store, SnapshotId)> {
+    record_in(Store::open().ok()?, tree, record, history::now())
+}
 
+fn record_in(
+    store: Store,
+    tree: &DiskEntry,
+    record: bool,
+    now: u64,
+) -> Option<(Store, SnapshotId)> {
+    let previous = store.list(tree.root_path()).pop();
     if record {
-        let _ = store.record(tree);
+        let after_previous = previous.as_ref().map_or(0, |id| id.taken_at + 1);
+        let _ = store.record_at(tree, now.max(after_previous));
     }
+    Some((store, previous?))
+}
 
-    let previous = previous?;
-    Some(disko_core::diff::diff(
+/// What changed between `previous` and `tree`, measured in `kind`.
+pub fn diff_since(previous: &Snapshot, tree: &DiskEntry, kind: SizeKind) -> Diff {
+    disko_core::diff::diff(
         &previous.tree,
         tree,
         kind,
         previous.taken_at,
-        now,
+        history::now(),
         previous.floor,
-    ))
+    )
 }
 
 fn home() -> Option<PathBuf> {
@@ -459,5 +502,53 @@ mod tests {
             "{text}"
         );
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Two scans within the same second must not write over each other, or
+    /// the comparison would lose the snapshot it compares against.
+    #[test]
+    fn a_scan_recorded_in_the_same_second_as_the_last_gets_the_next_second() {
+        let dir = std::env::temp_dir().join(format!("disko-record-in-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tree = DiskEntry::new(PathBuf::from("/data"), EntryType::Directory);
+
+        let first = record_in(Store::at(&dir).unwrap(), &tree, true, 1000);
+        assert!(first.is_none(), "nothing to compare against yet");
+        let (store, previous) = record_in(Store::at(&dir).unwrap(), &tree, true, 1000).unwrap();
+
+        assert_eq!(previous.taken_at, 1000);
+        let taken: Vec<u64> = store
+            .list(Path::new("/data"))
+            .iter()
+            .map(|id| id.taken_at)
+            .collect();
+        assert_eq!(taken, [1000, 1001]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_json_omits_the_private_aggregate_fields() {
+        let mut tree = DiskEntry::new(PathBuf::from("/root"), EntryType::Directory);
+        tree.allocated_size = 1000;
+        tree.apparent_size = 1000;
+        let snapshot = Snapshot {
+            root: PathBuf::from("/root"),
+            taken_at: 1,
+            total_allocated: 1000,
+            total_apparent: 1000,
+            items: 1,
+            floor: 0,
+            tree,
+        };
+
+        let public = vec![PublicSnapshot::from(&snapshot)];
+        let text = serde_json::to_string(&public).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(parsed[0]["root"], "/root");
+        assert_eq!(parsed[0]["taken_at"], 1);
+        assert_eq!(parsed[0]["tree"]["allocated_size"], 1000);
+        assert!(parsed[0]["tree"].get("own_modified").is_none());
+        assert!(parsed[0]["tree"].get("own_scan_state").is_none());
     }
 }

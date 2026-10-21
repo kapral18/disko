@@ -43,6 +43,12 @@ pub fn warning() -> Style {
     Style::default().fg(Color::Rgb(213, 94, 0))
 }
 
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+pub fn spinner(tick: usize) -> char {
+    SPINNER[tick % SPINNER.len()]
+}
+
 /// Terminals that set `NO_COLOR` get the braille outline instead of a filled
 /// colour sunburst. https://no-color.org
 pub fn colors_disabled() -> bool {

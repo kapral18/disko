@@ -142,7 +142,7 @@ fn color_cells(canvas: &Canvas, buffer: &mut Buffer) {
     }
 }
 
-pub fn draw(frame: &mut Frame, area: Rect, app: &App, chart: &mut ChartCache) {
+pub fn draw(frame: &mut Frame, area: Rect, app: &App, chart: &mut ChartCache, tick: usize) {
     let chunks = Layout::vertical([
         Constraint::Length(1), // breadcrumb
         Constraint::Length(1),
@@ -160,27 +160,67 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, chart: &mut ChartCache) {
     let rows = app.rows();
     let drawn = draw_chart(frame, body[0], app, &rows, chart);
     if legend_width > 0 {
-        draw_legend(frame, body[1], app, &rows);
+        draw_legend(frame, body[1], app, &rows, tick);
     }
     draw_selection(frame, chunks[3], app, &rows);
 
     // The breadcrumb comes after the chart because what the chart could draw
     // decides what this line has to admit.
-    let mut crumbs = vec![Span::styled(app.breadcrumb(), theme::heading())];
-    if let Some(taken_at) = app.provisional {
+    let total_width = chunks[0].width as usize;
+    let mut right_span = None;
+    let mut right_len = 0;
+
+    if let Some(taken_at) = app.provisional_for_cwd() {
         let age = disko_core::history::now().saturating_sub(taken_at);
-        crumbs.push(Span::styled(
-            format!("   as of {} · rescanning…", crate::timefmt::ago(age)),
-            theme::warning(),
-        ));
+        let rescan_str = format!(
+            "as of {} · {} rescanning…",
+            crate::timefmt::ago(age),
+            theme::spinner(tick)
+        );
+        right_len = crate::tui::text::width(&rescan_str);
+        right_span = Some(Span::styled(rescan_str, theme::warning()));
+    } else if app.cwd_is_being_scanned() {
+        let rescan_str = format!("{} rescanning…", theme::spinner(tick));
+        right_len = crate::tui::text::width(&rescan_str);
+        right_span = Some(Span::styled(rescan_str, theme::warning()));
     }
+
+    let mut left_note = None;
+    let mut left_note_len = 0;
     if let Some(note) = note(app, &rows, drawn) {
-        crumbs.push(Span::styled(format!("   {note}"), theme::secondary()));
+        let note_str = format!("   {note}");
+        left_note_len = crate::tui::text::width(&note_str);
+        left_note = Some(Span::styled(note_str, theme::secondary()));
+    }
+
+    let gap = if right_span.is_some() { 2 } else { 0 };
+    let note_len = if total_width.saturating_sub(right_len + gap + left_note_len) >= 12 {
+        left_note_len
+    } else {
+        left_note = None;
+        0
+    };
+
+    let crumb_budget = total_width.saturating_sub(right_len + gap + note_len);
+    let crumb_text = crate::tui::text::shorten_breadcrumb(&app.breadcrumb_parts(), crumb_budget);
+    let crumb_len = crate::tui::text::width(&crumb_text);
+
+    let left_len = crumb_len + note_len;
+    let padding = total_width.saturating_sub(left_len + right_len);
+
+    let mut crumbs = vec![Span::styled(crumb_text, theme::heading())];
+    if let Some(n) = left_note {
+        crumbs.push(n);
+    }
+    if let Some(r) = right_span {
+        if padding > 0 {
+            crumbs.push(Span::raw(" ".repeat(padding)));
+        }
+        crumbs.push(r);
     }
     frame.render_widget(Paragraph::new(Line::from(crumbs)), chunks[0]);
-    crate::tui::overview::draw_totals_warning(frame, chunks[1], app);
 
-    crate::tui::footer::draw(frame, chunks[4], app, None);
+    crate::tui::footer::draw(frame, chunks[4], app, tick);
 }
 
 /// What the chart could not say for itself.
@@ -297,7 +337,9 @@ fn draw_selection(frame: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
     }
 
     let growth = app.showing_growth();
-    let size = amount(row, growth, app.settings.unit);
+    let unit = app.settings.unit;
+    let size = amount(row, growth, unit);
+    let (_, scale) = app.legend_measure();
     // The swatch ties this line to the wedge and the legend row it repeats.
     let name = truncate(&row.name, total.saturating_sub(width(&size) + 5));
 
@@ -305,7 +347,7 @@ fn draw_selection(frame: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
         Paragraph::new(Line::from(vec![
             Span::styled(
                 "■ ",
-                Style::default().fg(theme::color(color_of(row, growth, scale(rows)))),
+                Style::default().fg(theme::color(color_of(row, growth, scale))),
             ),
             Span::styled(name, theme::heading()),
             Span::raw("   "),
@@ -315,26 +357,46 @@ fn draw_selection(frame: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
     );
 }
 
-fn draw_legend(frame: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
+fn draw_legend(frame: &mut Frame, area: Rect, app: &App, rows: &[Row], tick: usize) {
     let unit = app.settings.unit;
-    let capacity = area.height as usize;
-    if capacity == 0 || rows.is_empty() {
+    if area.height == 0 {
         return;
     }
+    if rows.is_empty() {
+        let message = truncate(
+            &crate::tui::overview::no_rows_message(app, tick),
+            area.width as usize,
+        );
+        frame.render_widget(Paragraph::new(Span::styled(message, theme::muted())), area);
+        return;
+    }
+
+    // The bottom line says what the legend does not list yet, as in the
+    // overview.
+    let mut area = area;
+    if area.height >= 2
+        && let Some(line) = crate::tui::overview::unlisted_line(app, tick, area.width as usize)
+    {
+        area.height -= 1;
+        let line_area = Rect {
+            y: area.y + area.height,
+            height: 1,
+            ..area
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(line, theme::warning())),
+            line_area,
+        );
+    }
+    let capacity = area.height as usize;
 
     // Keep the selection on screen when the legend is shorter than the list.
     let offset = app.selection.saturating_sub(capacity.saturating_sub(1));
     let visible = rows.iter().skip(offset).take(capacity);
 
     let growth = app.showing_growth();
-    let scale = scale(rows);
+    let (size_width, scale) = app.legend_measure();
     let amount = |row: &Row| amount(row, growth, unit);
-
-    let size_width = rows
-        .iter()
-        .map(|row| width(&amount(row)))
-        .max()
-        .unwrap_or(8);
     let name_width = (area.width as usize).saturating_sub(size_width + 5);
 
     let lines: Vec<Line> = visible
@@ -375,7 +437,18 @@ fn amount(row: &Row, growth: bool, unit: Unit) -> String {
     }
 }
 
-/// The biggest change on screen, which the growth colours are relative to.
+/// The legend's measure of every row: the widest amount, which the column is
+/// lined up to, and the biggest change, which growth colours are relative to.
+/// Both look at every row, so the app keeps them (`App::legend_measure`).
+pub(crate) fn measure(rows: &[Row], growth: bool, unit: Unit) -> (usize, i64) {
+    let size_width = rows
+        .iter()
+        .map(|row| width(&amount(row, growth, unit)))
+        .max()
+        .unwrap_or(8);
+    (size_width, scale(rows))
+}
+
 fn scale(rows: &[Row]) -> i64 {
     rows.iter()
         .map(|row| row.delta.unwrap_or(0).abs())
