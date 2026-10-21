@@ -75,6 +75,9 @@ pub struct DiskEntry {
     pub modified: u64,
     pub children: Vec<DiskEntry>,
     pub scan_state: ScanState,
+    /// Filesystem identity captured by the scanner. It is runtime safety
+    /// state, not part of snapshots or public JSON.
+    filesystem_identity: Option<(u64, u64)>,
 }
 
 impl DiskEntry {
@@ -90,6 +93,7 @@ impl DiskEntry {
             modified: 0,
             children: Vec::new(),
             scan_state: ScanState::Complete,
+            filesystem_identity: None,
         }
     }
 
@@ -133,7 +137,16 @@ impl DiskEntry {
             modified: self.modified,
             children: Vec::new(),
             scan_state: self.scan_state,
+            filesystem_identity: self.filesystem_identity,
         }
+    }
+
+    pub fn filesystem_identity(&self) -> Option<(u64, u64)> {
+        self.filesystem_identity
+    }
+
+    pub(crate) fn set_filesystem_identity(&mut self, identity: Option<(u64, u64)>) {
+        self.filesystem_identity = identity;
     }
 
     pub fn size(&self, kind: SizeKind) -> u64 {
@@ -374,6 +387,7 @@ mod wire {
                     .map(|child| child.into_entry(false))
                     .collect(),
                 scan_state: self.scan_state,
+                filesystem_identity: None,
             }
         }
     }

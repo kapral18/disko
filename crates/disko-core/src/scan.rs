@@ -280,6 +280,7 @@ fn entry_at(path: &Path, depth: usize, entry_type: EntryType) -> DiskEntry {
 
 fn scan_dir(path: &Path, meta: &Metadata, depth: usize, ctx: &Ctx) -> DiskEntry {
     let mut entry = entry_at(path, depth, EntryType::Directory);
+    entry.set_filesystem_identity(filesystem_identity(meta));
     // A directory's own inode occupies blocks, which is why `du` on an empty
     // tree is not zero. Its `st_size` is bookkeeping rather than content, so
     // it stays out of the apparent total — the same split `du` makes between
@@ -324,6 +325,7 @@ fn scan_dir(path: &Path, meta: &Metadata, depth: usize, ctx: &Ctx) -> DiskEntry 
                 ctx.options.one_file_system && device_of(&child_meta) != ctx.root_device;
             if crosses_filesystem || ctx.is_remote_mount(&child_path) {
                 let mut skipped = entry_at(&child_path, depth + 1, EntryType::Directory);
+                skipped.set_filesystem_identity(filesystem_identity(&child_meta));
                 skipped.modified = modified_of(&child_meta);
                 skipped.scan_state = ScanState::Skipped;
                 return Some(skipped);
@@ -363,6 +365,7 @@ fn leaf_entry(path: &Path, depth: usize, meta: &Metadata, ctx: &Ctx) -> DiskEntr
     };
 
     let mut entry = entry_at(path, depth, entry_type);
+    entry.set_filesystem_identity(filesystem_identity(meta));
     entry.modified = modified_of(meta);
 
     // A hard link seen a second time contributes nothing: the blocks were
@@ -434,6 +437,16 @@ fn inode_of(meta: &Metadata) -> u64 {
 #[cfg(not(unix))]
 fn inode_of(_meta: &Metadata) -> u64 {
     0
+}
+
+#[cfg(unix)]
+fn filesystem_identity(meta: &Metadata) -> Option<(u64, u64)> {
+    Some((device_of(meta), inode_of(meta)))
+}
+
+#[cfg(not(unix))]
+fn filesystem_identity(_meta: &Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 #[cfg(unix)]
@@ -670,6 +683,31 @@ mod tests {
             "capacity {} for a path of {} bytes",
             joined.capacity(),
             joined.as_os_str().len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_scanned_entry_keeps_its_filesystem_identity() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tree = TempTree::new("entry-identities");
+        tree.file("child.bin", 100);
+        // The scan keeps the canonical path; the temp dir may sit behind a
+        // symlink (`/var` on macOS).
+        let file = tree.0.canonicalize().unwrap().join("child.bin");
+        let root_meta = fs::symlink_metadata(&tree.0).unwrap();
+        let file_meta = fs::symlink_metadata(&file).unwrap();
+
+        let scanned = scan_tree(&tree.0, ScanOptions::default());
+
+        assert_eq!(
+            scanned.filesystem_identity(),
+            Some((root_meta.dev(), root_meta.ino()))
+        );
+        assert_eq!(
+            scanned.resolve(&file).unwrap().filesystem_identity(),
+            Some((file_meta.dev(), file_meta.ino()))
         );
     }
 

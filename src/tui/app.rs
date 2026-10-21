@@ -25,7 +25,12 @@ fn deletion_status(
     outcomes: &[Outcome],
     unit: Unit,
 ) -> String {
-    let first_problem = outcomes.iter().find(|outcome| !outcome.succeeded());
+    // Name the outcome that left the tree in an unknown state when there is
+    // one; a refusal that touched nothing is less urgent than that.
+    let first_problem = outcomes
+        .iter()
+        .find(|outcome| !outcome.succeeded() && outcome.changed_tree())
+        .or_else(|| outcomes.iter().find(|outcome| !outcome.succeeded()));
     let problem_hint = first_problem.map(|outcome| {
         format!(
             "{}: {}",
@@ -33,8 +38,18 @@ fn deletion_status(
             outcome.detail()
         )
     });
+    let incomplete = first_problem.is_some_and(Outcome::changed_tree);
 
     match (deleted, skipped) {
+        (0, _) if incomplete => problem_hint
+            .map(|hint| match freed {
+                0 => format!("deletion incomplete — {hint}"),
+                _ => format!(
+                    "deletion incomplete · freed {} — {hint}",
+                    disko_core::size::format(freed, unit)
+                ),
+            })
+            .unwrap_or_else(|| "deletion incomplete — d for details".into()),
         (0, _) => problem_hint
             .map(|hint| format!("nothing deleted — {hint}"))
             .unwrap_or_else(|| "nothing deleted — d for details".into()),
@@ -245,6 +260,9 @@ pub struct App {
     tick: usize,
     session: Option<Session>,
     mode: ScanMode,
+    /// A deletion left totals that subtracting could not fix, and no scan has
+    /// replaced them yet.
+    totals_off: bool,
     /// How many times the tree behind the view has been replaced or edited.
     revision: u64,
     /// The last sunburst built, kept for as long as it stands.
@@ -284,6 +302,7 @@ impl App {
             tick: 0,
             session: None,
             mode: ScanMode::Fresh,
+            totals_off: false,
             revision: 0,
             radial: RefCell::new(None),
         }
@@ -311,7 +330,7 @@ impl App {
     /// Scan the same place again without disturbing the view — what watch mode
     /// does on every tick, and what `r` does on demand.
     pub fn refresh(&mut self) {
-        if self.root.as_os_str().is_empty() || self.session.is_some() {
+        if self.root.as_os_str().is_empty() || self.session.is_some() || self.deleting.is_some() {
             return;
         }
         let root = self.root.clone();
@@ -324,6 +343,7 @@ impl App {
         self.touch();
 
         if mode == ScanMode::Fresh {
+            self.totals_off = false;
             self.filesystem = disko_core::mounts::for_path(&path);
             self.root = path.clone();
             self.cwd = path.clone();
@@ -366,6 +386,9 @@ impl App {
             self.settings.scan_options.clone(),
             STREAM_DEPTH,
         );
+        // `r` while a scan is still running lands here; nothing would ever
+        // read that scan's result.
+        self.cancel_scan();
         self.session = Some(Session {
             progress,
             cancel,
@@ -381,6 +404,14 @@ impl App {
 
     /// Kick off a rescan when the watch interval is up.
     pub fn tick_watch(&mut self) {
+        if self.confirm.is_some() || self.deleting.is_some() {
+            // Held back by a deletion. The interval starts over once it is
+            // settled, or an overdue rescan would refuse the next `x`.
+            if let Some(watch) = &mut self.watch {
+                watch.last_scan = Instant::now();
+            }
+            return;
+        }
         let due = self
             .watch
             .as_ref()
@@ -503,6 +534,7 @@ impl App {
         self.touch();
         // Whatever is on screen is now the real thing.
         self.provisional = None;
+        self.totals_off = false;
         self.streamed.clear();
         if self.mode == ScanMode::Fresh {
             self.view = View::Overview;
@@ -522,6 +554,11 @@ impl App {
     /// True while the screen is showing last-known numbers.
     pub fn is_provisional(&self) -> bool {
         self.provisional.is_some() && self.session.is_some()
+    }
+
+    /// True when a deletion left totals on screen that only a rescan can fix.
+    pub fn totals_may_be_off(&self) -> bool {
+        self.totals_off
     }
 
     /// Switch between "what is big" and "what changed".
@@ -667,6 +704,10 @@ impl App {
             self.status = Some("disko is running read-only".into());
             return;
         }
+        if self.session.is_some() {
+            self.status = Some("wait for the scan to finish before deleting".into());
+            return;
+        }
         let Some(tree) = &self.tree else { return };
 
         let paths: Vec<PathBuf> = if self.marks.is_empty() {
@@ -686,6 +727,8 @@ impl App {
                 let entry = tree.resolve(&path)?;
                 Some(Target {
                     size: entry.size(self.settings.size_kind),
+                    allocated_size: entry.allocated_size,
+                    filesystem_identity: entry.filesystem_identity(),
                     is_dir: entry.is_dir(),
                     path,
                 })
@@ -728,6 +771,10 @@ impl App {
     /// files takes long enough that doing it here would freeze the screen with
     /// no way to tell whether anything was happening.
     pub fn commit_delete(&mut self) {
+        if self.session.is_some() {
+            self.status = Some("wait for the scan to finish before deleting".into());
+            return;
+        }
         let Some(confirm) = &mut self.confirm else {
             return;
         };
@@ -740,7 +787,9 @@ impl App {
         self.confirm = None;
         self.outcomes.clear();
 
-        let (progress, cancel, handle) = deletion::delete_in_background(targets, self.root.clone());
+        let root_identity = self.tree.as_ref().and_then(DiskEntry::filesystem_identity);
+        let (progress, cancel, handle) =
+            deletion::delete_in_background(targets, self.root.clone(), root_identity);
         self.deleting = Some(Deleting {
             progress,
             cancel,
@@ -818,6 +867,10 @@ impl App {
         // The row under the cursor may have just been removed.
         let rows = self.rows().len();
         self.selection = self.selection.min(rows.saturating_sub(1));
+
+        // A removal that stopped part-way, or freed a different amount than
+        // the scan counted, leaves totals that subtracting cannot fix.
+        self.totals_off |= self.outcomes.iter().any(Outcome::needs_rescan);
     }
 
     /// Drop everything belonging to the current scan and show the disks again.
@@ -1303,6 +1356,229 @@ mod tests {
     }
 
     #[test]
+    fn deletion_cannot_start_while_a_scan_can_still_replace_the_tree() {
+        let mut app = app_with_tree();
+        app.begin(&PathBuf::from("/root"), ScanMode::Refresh);
+
+        app.request_delete();
+
+        assert!(app.confirm.is_none());
+        assert!(app.status.as_deref().unwrap().contains("scan to finish"));
+    }
+
+    #[test]
+    fn an_armed_confirmation_is_rechecked_if_a_scan_started_after_it_opened() {
+        let mut app = app_with_tree();
+        app.request_delete();
+        app.confirm.as_mut().unwrap().typed = CONFIRM_WORD.to_string();
+        app.begin(&PathBuf::from("/root"), ScanMode::Refresh);
+
+        app.commit_delete();
+
+        assert!(app.deleting.is_none());
+        assert!(app.confirm.is_some());
+    }
+
+    #[test]
+    fn an_armed_confirmation_blocks_a_background_refresh() {
+        let mut app = app_with_tree();
+        app.watch = Some(Watch::new(0));
+        app.request_delete();
+        app.confirm.as_mut().unwrap().typed = CONFIRM_WORD.to_string();
+
+        app.tick_watch();
+
+        assert!(app.session.is_none());
+        assert!(app.confirm.is_some());
+    }
+
+    #[test]
+    fn cancelling_a_deletion_gives_the_watch_a_full_interval() {
+        let mut app = app_with_tree();
+        app.watch = Some(Watch::new(60));
+        // Just short of due: the reset must not wait for a due frame.
+        app.watch.as_mut().unwrap().last_scan = Instant::now() - Duration::from_secs(59);
+        app.request_delete();
+        app.tick_watch();
+
+        app.cancel_delete();
+        app.tick_watch();
+
+        assert!(app.session.is_none());
+        assert!(app.watch.as_ref().unwrap().last_scan.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn watch_mode_does_not_rescan_while_a_deletion_runs() {
+        let mut app = app_with_tree();
+        app.watch = Some(Watch::new(60));
+        app.watch.as_mut().unwrap().last_scan = Instant::now() - Duration::from_secs(59);
+        let (progress, cancel, handle) =
+            deletion::delete_in_background(Vec::new(), app.root.clone(), None);
+        app.deleting = Some(Deleting {
+            progress,
+            cancel,
+            handle: Some(handle),
+            stopping: false,
+        });
+
+        app.tick_watch();
+        app.refresh();
+        assert!(app.session.is_none());
+
+        // Once it is done, the watch waits a full interval again.
+        app.deleting = None;
+        app.tick_watch();
+        assert!(app.session.is_none());
+        assert!(app.watch.as_ref().unwrap().last_scan.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_partial_deletion_flags_the_totals_instead_of_trusting_them() {
+        let mut app = app_with_tree();
+
+        app.apply_outcomes(vec![Outcome::Failed {
+            path: PathBuf::from("/root/big"),
+            error: "stopped part-way through".into(),
+            removed_bytes: 0,
+            removed_entries: 0,
+            tree_may_have_changed: true,
+        }]);
+
+        assert!(app.totals_may_be_off());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .contains("deletion incomplete")
+        );
+    }
+
+    #[test]
+    fn flagged_totals_are_shown_until_a_scan_replaces_them() {
+        let drifted = || Outcome::Deleted {
+            path: PathBuf::from("/root/small"),
+            freed: 0,
+            tree_needs_rescan: true,
+        };
+        let render =
+            |app: &mut App, width| crate::tui::render_lines(app, width, 30).unwrap().join("\n");
+
+        let mut app = app_with_tree();
+        app.tree.as_mut().unwrap().scan_state = disko_core::ScanState::Partial;
+        app.apply_outcomes(vec![drifted()]);
+
+        // Whole at 80 columns, and beside the scan's own note.
+        let screen = render(&mut app, 80);
+        assert!(screen.contains("totals may be off — press r"), "{screen}");
+        let screen = render(&mut app, 120);
+        assert!(
+            screen.contains("some folders skipped or unreadable"),
+            "{screen}"
+        );
+        app.view = View::Explorer;
+        let screen = render(&mut app, 80);
+        assert!(screen.contains("totals may be off — press r"), "{screen}");
+
+        // Beside an ordinary path, without pushing the folder's own size or
+        // name off the line.
+        let deep = "/Users/someone/code/disko/main";
+        let mut app = App::new(settings(), false);
+        app.root = PathBuf::from(deep);
+        app.cwd = PathBuf::from(deep);
+        app.tree = Some(entry(
+            deep,
+            1000,
+            vec![entry(&format!("{deep}/x"), 1000, vec![])],
+        ));
+        app.view = View::Overview;
+        app.totals_off = true;
+        let size = disko_core::size::format(1000, Unit::Decimal);
+        let screen = render(&mut app, 80);
+        assert!(screen.contains("totals may be off — press r"), "{screen}");
+        assert!(screen.contains(&format!("{deep}    {size}")), "{screen}");
+        app.view = View::Explorer;
+        let screen = render(&mut app, 80);
+        assert!(screen.contains("totals may be off — press r"), "{screen}");
+        assert!(screen.contains(&app.breadcrumb()), "{screen}");
+
+        // A rescan in place keeps the old numbers up until it lands.
+        app.watch = Some(Watch::new(60));
+        app.begin(&PathBuf::from("/root"), ScanMode::Refresh);
+        assert!(app.totals_may_be_off());
+        app.cancel_scan();
+        app.absorb_scan(entry("/root", 700, vec![]));
+        assert!(!app.totals_may_be_off());
+
+        // A fresh scan takes them down at once.
+        let mut app = app_with_tree();
+        app.apply_outcomes(vec![drifted()]);
+        app.begin(&PathBuf::from("/root"), ScanMode::Fresh);
+        assert!(!app.totals_may_be_off());
+        app.cancel_scan();
+    }
+
+    #[test]
+    fn starting_a_scan_stops_the_one_it_replaces() {
+        let mut app = app_with_tree();
+        app.begin(&PathBuf::from("/root"), ScanMode::Refresh);
+        let replaced = app.session.as_ref().unwrap().cancel.clone();
+
+        app.rescan();
+
+        assert!(replaced.is_cancelled());
+        assert!(!app.session.as_ref().unwrap().cancel.is_cancelled());
+        app.cancel_scan();
+    }
+
+    #[test]
+    fn the_deletion_hint_names_the_outcome_that_changed_the_tree() {
+        let outcomes = vec![
+            Outcome::Refused {
+                path: PathBuf::from("/r/refused"),
+                reason: deletion::Refusal::OutsideScan,
+            },
+            Outcome::Failed {
+                path: PathBuf::from("/r/interrupted"),
+                error: "stopped".into(),
+                removed_bytes: 10,
+                removed_entries: 1,
+                tree_may_have_changed: true,
+            },
+        ];
+
+        let status = deletion_status(0, 2, 10, &outcomes, Unit::Decimal);
+
+        assert!(status.starts_with("deletion incomplete"), "{status}");
+        assert!(status.contains("interrupted"), "{status}");
+    }
+
+    #[test]
+    fn totals_a_deletion_cannot_vouch_for_are_flagged_not_rescanned() {
+        let deleted = |path: &str, tree_needs_rescan| Outcome::Deleted {
+            path: PathBuf::from(path),
+            freed: 300,
+            tree_needs_rescan,
+        };
+
+        let mut app = app_with_tree();
+        app.apply_outcomes(vec![deleted("/root/small", false)]);
+        assert!(!app.totals_may_be_off());
+
+        let mut app = app_with_tree();
+        app.apply_outcomes(vec![deleted("/root/small", true)]);
+        assert!(app.totals_may_be_off());
+        assert!(app.session.is_none());
+
+        // A clean deletion afterwards does not vouch for the earlier one.
+        let mut app = app_with_tree();
+        app.apply_outcomes(vec![deleted("/root/small", true)]);
+        app.apply_outcomes(vec![deleted("/root/big", false)]);
+        assert!(app.totals_may_be_off());
+        assert!(app.session.is_none());
+    }
+
+    #[test]
     fn opening_a_directory_descends_and_resets_the_selection() {
         let mut app = app_with_tree();
         app.selection = 1;
@@ -1414,7 +1690,8 @@ mod tests {
         // ...but editing the tree does not.
         app.apply_outcomes(vec![Outcome::Deleted {
             path: PathBuf::from("/root/small"),
-            size: 300,
+            freed: 300,
+            tree_needs_rescan: false,
         }]);
         assert_eq!(app.revision, 1);
         assert_eq!(app.radial_tree(2).id_of(Path::new("/root/small")), None);

@@ -284,7 +284,12 @@ reached. Every path
 is re-checked against the filesystem immediately before removal, so disko will
 refuse the scan root, anything outside the current scan, a mount point, or
 something that has vanished since the scan. Symlinks are unlinked, never
-followed into. Totals correct themselves instantly, without a rescan.
+followed into.
+
+Totals usually correct themselves instantly, by subtracting what was removed.
+When a deletion stops part-way or frees a different amount than the scan
+counted, subtracting can't fix them, and disko says `totals may be off — press
+r` under the current folder until a rescan replaces them.
 
 `disko --read-only` removes the ability entirely.
 

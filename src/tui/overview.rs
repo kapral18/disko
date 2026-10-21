@@ -45,6 +45,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, list_state: &mut ListState
 
     draw_capacity(frame, chunks[0], chunks[1], app);
     draw_current_folder(frame, chunks[3], app);
+    draw_totals_warning(frame, chunks[4], app);
     draw_rows(frame, chunks[5], app, &rows, list_state);
     if largest_height > 0 {
         draw_largest(frame, chunks[6], app);
@@ -129,6 +130,20 @@ fn draw_capacity(frame: &mut Frame, name_area: Rect, bar_area: Rect, app: &App) 
         ])),
         bar_area,
     );
+}
+
+/// On a row of its own, under the line whose numbers it is about, so that no
+/// path is long enough to push either one off the screen.
+pub fn draw_totals_warning(frame: &mut Frame, area: Rect, app: &App) {
+    if app.totals_may_be_off() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "totals may be off — press r",
+                theme::warning(),
+            )),
+            area,
+        );
+    }
 }
 
 /// And this line always describes the directory, so the two numbers can never

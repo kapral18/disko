@@ -843,6 +843,8 @@ fn the_scan_root_itself_can_never_be_deleted() {
         targets: vec![disko::deletion::Target {
             path: sandbox.0.clone(),
             size: 4000,
+            allocated_size: 4000,
+            filesystem_identity: None,
             is_dir: true,
         }],
         typed: "delete".to_string(),
