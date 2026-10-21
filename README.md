@@ -133,7 +133,8 @@ directory is doing it.
 ### It opens instantly
 
 disko paints the last snapshot the moment you open it, labelled for what it is,
-and corrects itself as the fresh scan lands a fraction of a second later:
+and corrects itself as the fresh scan lands a fraction of a second later (shown
+here in the list view):
 
 ```text
  Current folder: ~/code    78 GB    as of 2 hours ago · rescanning…
@@ -204,11 +205,11 @@ only counts as build output when a `Cargo.toml` sits beside it.
 ```bash
 disko              # pick a disk, then explore it
 disko ~            # scan your home directory right away
-disko / --top 20   # the 20 largest things on the root filesystem
+disko / --top 20   # limit the list view to the 20 largest entries
 ```
 
-The default screen answers three questions and nothing else — what is full,
-what is using the space, where to look next:
+Disks open in the radial chart by default. Use `l` / `→` to open a folder
+and `h` / `←` to go up. Press `Tab` to switch between the chart and this list:
 
 ```text
  Macintosh HD                                      404 GB used of 494 GB
@@ -226,13 +227,17 @@ what is using the space, where to look next:
    32 GB   ~/code
 ```
 
-Press `Enter` for a DaisyDisk-style sunburst you can walk into.
+The view you pick with `Tab` stays in place across scans and disk changes.
+It is saved when you quit, to `~/.config/disko/view`
+(`~/Library/Application Support/disko/view` on macOS), and restored next time.
 
 | Key | Does |
 | --- | --- |
-| `↑` `↓` | move the selection |
+| `j` `k` / `↓` `↑` | move the selection |
+| `Tab` | switch between chart and list |
 | `Enter` | open the radial explorer (and drill in, once there) |
-| `→` `←` | open the selected folder / go back up |
+| `l` `→` / `h` `←` `Backspace` | open the selected folder / go back up |
+| `Esc` | close details or search, step from the chart to the list, then back to the disk list |
 | **`t`** | **switch between size and growth** |
 | `/` | filter the list as you type |
 | `s` | cycle sort: size, name, item count |
@@ -371,7 +376,7 @@ exact, so it does not make a slow mount fast.
 
 | Flag | Does |
 | --- | --- |
-| `-t, --top <N>` | show the N largest entries, grouping the rest as "Other" |
+| `-t, --top <N>` | limit list and text output to N entries, grouping the rest as "Other" |
 | `--depth <N>` | keep only N levels of tree; sizes stay exact either way |
 | `--apparent` | count file lengths (`ls`) instead of blocks used (`du`) |
 | `--binary` | GiB/MiB instead of GB/MB |

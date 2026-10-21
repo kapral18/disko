@@ -1,4 +1,4 @@
-//! The default screen: what is full, what is using the space, where to look
+//! The ranked list: what is full, what is using the space, where to look
 //! next — and nothing else.
 
 use disko_core::size::{format, format_percent, format_percent_whole};

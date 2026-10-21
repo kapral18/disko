@@ -108,8 +108,6 @@ fn minimum_width(app: &App) -> usize {
 
 fn quit_hint(app: &App) -> Hint {
     match app.view {
-        // Escape steps back to the overview rather than leaving.
-        View::Explorer => ("Esc", "back"),
         View::Scanning => ("Esc", "stop"),
         _ => QUIT,
     }
@@ -119,9 +117,9 @@ fn quit_hint(app: &App) -> Hint {
 fn hints_for(view: View) -> &'static [Hint] {
     match view {
         View::Overview => &[
-            ("Enter", "explore"),
-            ("→", "open"),
-            ("←", "back"),
+            ("Tab", "chart"),
+            ("l/→", "open"),
+            ("h/←", "up"),
             ("t", "growth"),
             ("Space", "mark"),
             ("x", "delete"),
@@ -131,9 +129,9 @@ fn hints_for(view: View) -> &'static [Hint] {
             ("d", "details"),
         ],
         View::Explorer => &[
-            ("↑↓", "select"),
+            ("Tab", "list"),
             ("Enter", "open"),
-            ("←", "back"),
+            ("h/←", "up"),
             ("t", "growth"),
             ("Space", "mark"),
             ("x", "delete"),

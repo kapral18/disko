@@ -7,6 +7,7 @@ mod explorer;
 mod footer;
 mod overview;
 mod picker;
+mod preferences;
 mod scanning;
 mod text;
 mod theme;
@@ -27,6 +28,7 @@ use ratatui::widgets::ListState;
 use ratatui::{Frame, Terminal};
 
 use app::{App, View};
+use preferences::BrowseView;
 
 /// How long a frame waits for input before redrawing anyway. Fast enough that
 /// the scan progress looks live, slow enough to stay idle when nothing moves.
@@ -70,9 +72,21 @@ struct Ui {
 }
 
 pub fn run(mut app: App) -> Result<()> {
+    let preference_path = preferences::path();
+    let saved_view = preference_path
+        .as_deref()
+        .map(preferences::load)
+        .unwrap_or_default();
+    apply_saved_view(&mut app, saved_view);
     let mut terminal = enter()?;
     let result = event_loop(&mut terminal, &mut app);
     leave(&mut terminal)?;
+    if app.browsing_view != saved_view
+        && let Some(path) = preference_path
+        && let Err(error) = preferences::save(&path, app.browsing_view)
+    {
+        eprintln!("disko: could not save the view preference: {error}");
+    }
     result
 }
 
@@ -315,7 +329,7 @@ fn handle_browsing(app: &mut App, key: KeyEvent) {
             } else if app.search.is_some() {
                 app.clear_search();
             } else if app.view == View::Explorer {
-                app.view = View::Overview;
+                app.show_view(BrowseView::List);
             } else if app.from_picker {
                 // Nothing left to close: step back out to the disk list.
                 app.return_to_picker();
@@ -332,15 +346,16 @@ fn handle_browsing(app: &mut App, key: KeyEvent) {
         // From the overview, Enter switches to the radial explorer; once
         // there, Enter drills into whatever is selected.
         KeyCode::Enter => match app.view {
-            View::Overview => app.view = View::Explorer,
+            View::Overview => app.show_view(BrowseView::Chart),
             _ => app.open_selected(),
         },
         KeyCode::Tab => {
-            app.view = if app.view == View::Overview {
-                View::Explorer
+            let view = if app.view == View::Overview {
+                BrowseView::Chart
             } else {
-                View::Overview
-            }
+                BrowseView::List
+            };
+            app.set_browsing_view(view);
         }
         KeyCode::Right | KeyCode::Char('l') => app.open_selected(),
         KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => app.go_up(),
@@ -356,6 +371,15 @@ fn handle_browsing(app: &mut App, key: KeyEvent) {
         KeyCode::Char('x') | KeyCode::Delete => app.request_delete(),
         KeyCode::Char('r') => app.rescan(),
         _ => {}
+    }
+}
+
+/// Open on the view saved last time. A remembered snapshot may already be on
+/// screen, painted in the default view before the preference was read.
+fn apply_saved_view(app: &mut App, view: BrowseView) {
+    app.browsing_view = view;
+    if matches!(app.view, View::Overview | View::Explorer) {
+        app.show_view(view);
     }
 }
 
@@ -437,6 +461,62 @@ mod tests {
 
         handle_key(&mut app, press(KeyCode::Enter));
         assert_eq!(app.cwd, PathBuf::from("/root/big"));
+    }
+
+    /// The chart lists every entry and the list stops at `--top`, so leaving
+    /// the chart must not leave the cursor past the end of the list.
+    #[test]
+    fn switching_to_the_list_keeps_the_cursor_on_a_row() {
+        let mut app = test_app();
+        app.settings.top = 1;
+        let mut extra = DiskEntry::new(PathBuf::from("/root/extra"), EntryType::Directory);
+        extra.allocated_size = 50;
+        app.tree.as_mut().unwrap().children.push(extra);
+        app.view = View::Explorer;
+        app.selection = 2;
+
+        handle_key(&mut app, press(KeyCode::Tab));
+        assert_eq!(app.view, View::Overview);
+        assert!(app.selection < app.rows().len(), "{}", app.selection);
+    }
+
+    /// Enter and Esc step between the views; only Tab picks the one scans
+    /// open on, so backing out of the chart does not undo opening on it.
+    #[test]
+    fn only_tab_changes_the_view_scans_open_on() {
+        let mut app = test_app();
+        app.view = View::Explorer;
+        for (key, view, kept) in [
+            (KeyCode::Tab, View::Overview, BrowseView::List),
+            (KeyCode::Enter, View::Explorer, BrowseView::List),
+            (KeyCode::Esc, View::Overview, BrowseView::List),
+            (KeyCode::Tab, View::Explorer, BrowseView::Chart),
+            (KeyCode::Esc, View::Overview, BrowseView::Chart),
+        ] {
+            handle_key(&mut app, press(key));
+            assert_eq!((app.view, app.browsing_view), (view, kept), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_saved_view_replaces_a_snapshot_painted_in_the_default_one() {
+        let mut app = test_app();
+        app.settings.top = 1;
+        let mut extra = DiskEntry::new(PathBuf::from("/root/extra"), EntryType::Directory);
+        extra.allocated_size = 50;
+        app.tree.as_mut().unwrap().children.push(extra);
+        app.view = View::Explorer;
+        app.selection = 2;
+
+        apply_saved_view(&mut app, BrowseView::List);
+        assert_eq!(app.view, View::Overview);
+        assert!(app.selection < app.rows().len(), "{}", app.selection);
+
+        // A scan still running opens on the saved view when it lands.
+        app.view = View::Scanning;
+        apply_saved_view(&mut app, BrowseView::Chart);
+        assert_eq!(app.view, View::Scanning);
+        assert_eq!(app.browsing_view, BrowseView::Chart);
     }
 
     #[test]
