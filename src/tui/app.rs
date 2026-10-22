@@ -190,8 +190,10 @@ impl RadialCache {
     }
 
     /// The normal wedges plus the selected sliver, if it was too thin to draw.
-    /// Both layouts assign ids in layout order, so inserting by id preserves
-    /// the sibling order used to highlight a run of tiny wedges.
+    /// `build_radial` and `build_growth_radial` number nodes depth-first, the
+    /// order `layout` emits them in, so both layouts are sorted by id and
+    /// inserting by id preserves the sibling order used to highlight a run of
+    /// tiny wedges.
     pub fn segments(&self, pinned: Option<usize>) -> Segments {
         let rings = self.key.rings;
         let visible = self.visible.get_or_init(|| {
