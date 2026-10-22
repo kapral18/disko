@@ -147,7 +147,7 @@ fn disk_capacity_and_directory_usage_are_never_the_same_line() {
 }
 
 #[test]
-fn filesystem_language_stays_out_of_the_default_view() {
+fn filesystem_language_stays_out_of_the_list_view() {
     let screen = joined(&render_lines(&mut app(), 100, 30).unwrap());
 
     for jargon in ["apfs", "/dev/disk3s1s1", "inode", "block"] {
@@ -223,6 +223,58 @@ fn deep_breadcrumbs_keep_their_last_folder_in_narrow_split_panes() {
         screen.contains("client"),
         "the identifying tail was lost\n{screen}"
     );
+}
+
+#[test]
+fn a_rescan_note_never_crowds_out_the_folder_name() {
+    for view in [View::Overview, View::Explorer] {
+        for width in [40, 60] {
+            let mut app = app();
+            app.view = view;
+            app.cwd = PathBuf::from("/Users/cesar");
+            // Painted from a snapshot two hours old.
+            app.provisional = Some(disko_core::history::now().saturating_sub(7200));
+
+            let lines = render_lines(&mut app, width, 30).unwrap();
+            let header = match view {
+                View::Overview => lines
+                    .iter()
+                    .find(|line| line.contains("Current folder"))
+                    .unwrap(),
+                _ => &lines[0],
+            };
+            assert!(header.contains("cesar"), "{view:?} at {width}: {header:?}");
+            // The note starts at "as of" or at the spinner before
+            // "rescanning"; whatever comes before it must end in a space.
+            if let Some(at) = header.find("rescanning") {
+                let start = header
+                    .find("as of")
+                    .unwrap_or_else(|| header[..at].trim_end().char_indices().last().unwrap().0);
+                assert!(
+                    header[..start].ends_with(' '),
+                    "{view:?} at {width}: {header:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_short_folder_name_leaves_room_for_the_incomplete_note() {
+    let mut app = app();
+    app.view = View::Overview;
+    app.tree
+        .as_mut()
+        .unwrap()
+        .set_scan_state(disko_core::ScanState::Partial);
+    app.cwd = app.root.clone();
+
+    let lines = render_lines(&mut app, 74, 30).unwrap();
+    let header = lines
+        .iter()
+        .find(|line| line.contains("Current folder"))
+        .unwrap();
+    assert!(header.contains("some folders skipped"), "{header:?}");
 }
 
 #[test]
@@ -864,9 +916,7 @@ fn finish_scan(app: &mut App) {
 #[test]
 fn a_scan_opens_on_the_chart_unless_the_list_was_picked() {
     let sandbox = Sandbox::new("browse-view");
-    let mut app = app_over(&sandbox.0);
-    app.view = View::Picker;
-    let mut app = app.with_path(&sandbox.0);
+    let mut app = app_over(&sandbox.0).with_path(&sandbox.0);
     finish_scan(&mut app);
     assert_eq!(app.view, View::Explorer);
 
@@ -1097,6 +1147,21 @@ fn the_explorer_says_so_too() {
 
     let screen = joined(&render_lines(&mut app, 100, 30).unwrap());
     assert!(screen.contains("rescanning"), "{screen}");
+}
+
+#[test]
+fn a_kept_snapshot_keeps_its_age_but_stops_saying_rescanning() {
+    let mut app = app();
+    app.provisional = Some(disko_core::history::now() - 7200);
+    // `z` stopped the scan that was correcting it.
+    app.snapshot_kept = true;
+
+    for view in [View::Overview, View::Explorer] {
+        app.view = view;
+        let screen = joined(&render_lines(&mut app, 100, 30).unwrap());
+        assert!(screen.contains("as of 2 hours ago"), "{screen}");
+        assert!(!screen.contains("rescanning"), "{screen}");
+    }
 }
 
 #[test]

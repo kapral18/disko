@@ -170,19 +170,12 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, chart: &mut ChartCache, ti
     let mut right_span = None;
     let mut right_len = 0;
 
-    if let Some(taken_at) = app.provisional_for_cwd() {
-        let age = disko_core::history::now().saturating_sub(taken_at);
-        let rescan_str = format!(
-            "as of {} · {} rescanning…",
-            crate::timefmt::ago(age),
-            theme::spinner(tick)
-        );
-        right_len = crate::tui::text::width(&rescan_str);
-        right_span = Some(Span::styled(rescan_str, theme::warning()));
-    } else if app.cwd_is_being_scanned() {
-        let rescan_str = format!("{} rescanning…", theme::spinner(tick));
-        right_len = crate::tui::text::width(&rescan_str);
-        right_span = Some(Span::styled(rescan_str, theme::warning()));
+    let crumb_floor = crate::tui::overview::MIN_PATH_WIDTH
+        .min(crate::tui::text::width(&app.breadcrumb_parts().join(" › ")));
+    let room = total_width.saturating_sub(2 + crumb_floor);
+    if let Some(note) = crate::tui::overview::rescan_note(app, tick, room) {
+        right_len = crate::tui::text::width(&note);
+        right_span = Some(Span::styled(note, theme::warning()));
     }
 
     let mut left_note = None;

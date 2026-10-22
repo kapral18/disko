@@ -42,33 +42,39 @@ fn deletion_status(
     });
     let incomplete = first_problem.is_some_and(Outcome::changed_tree);
 
-    match (deleted, skipped) {
-        (0, _) if incomplete => problem_hint
-            .map(|hint| match freed {
-                0 => format!("deletion incomplete — {hint}"),
-                _ => format!(
-                    "deletion incomplete · freed {} — {hint}",
-                    disko_core::size::format(freed, unit)
-                ),
-            })
-            .unwrap_or_else(|| "deletion incomplete — d for details".into()),
-        (0, _) => problem_hint
+    match (deleted, skipped, problem_hint) {
+        (0, _, Some(hint)) if incomplete => match freed {
+            0 => format!("deletion incomplete — {hint}"),
+            _ => format!(
+                "deletion incomplete · freed {} — {hint}",
+                disko_core::size::format(freed, unit)
+            ),
+        },
+        (0, _, hint) => hint
             .map(|hint| format!("nothing deleted — {hint}"))
             .unwrap_or_else(|| "nothing deleted — d for details".into()),
-        (n, 0) => format!(
+        (n, 0, _) => format!(
             "deleted {n} · freed {}",
             disko_core::size::format(freed, unit)
         ),
-        (n, 1) => {
+        // A half-removed item is not merely skipped: say so even when others
+        // were deleted. The hint names it.
+        (n, 1, Some(hint)) if incomplete => format!(
+            "deleted {n} · freed {} · deletion incomplete — {hint}",
+            disko_core::size::format(freed, unit)
+        ),
+        (n, skipped, Some(hint)) if incomplete => format!(
+            "deleted {n} · freed {} · {skipped} not deleted · deletion incomplete — {hint} · d for details",
+            disko_core::size::format(freed, unit)
+        ),
+        (n, 1, hint) => {
             let base = format!(
                 "deleted {n} · freed {} · 1 skipped",
                 disko_core::size::format(freed, unit)
             );
-            problem_hint
-                .map(|hint| format!("{base} — {hint}"))
-                .unwrap_or(base)
+            hint.map(|hint| format!("{base} — {hint}")).unwrap_or(base)
         }
-        (n, skipped) => format!(
+        (n, skipped, _) => format!(
             "deleted {n} · freed {} · {skipped} skipped — d for details",
             disko_core::size::format(freed, unit)
         ),
@@ -120,6 +126,8 @@ pub enum Listing {
     BeyondDepth,
     /// Counted but not all listed, or never finished; a scan can fill it.
     Short,
+    /// A mount point the scan stopped at; only scanning it directly lists it.
+    Skipped,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -230,8 +238,10 @@ impl RadialCache {
     }
 
     /// The normal wedges plus the selected sliver, if it was too thin to draw.
-    /// Both layouts assign ids in layout order, so inserting by id preserves
-    /// the sibling order used to highlight a run of tiny wedges.
+    /// `build_radial` and `build_growth_radial` number nodes depth-first, the
+    /// order `layout` emits them in, so both layouts are sorted by id and
+    /// inserting by id preserves the sibling order used to highlight a run of
+    /// tiny wedges.
     pub fn segments(&self, pinned: Option<usize>) -> Segments {
         let visible = self.visible.get_or_init(|| {
             Arc::new(radial::layout(
@@ -281,9 +291,8 @@ struct RadialKey {
 
 /// Whether a running scan owns the whole tree or is grafted into a subtree.
 ///
-/// Recorded when the session begins rather than worked out from
-/// `scanned_path == self.root` later: a `Refresh` can re-canonicalize
-/// `self.root` before the old session's result lands.
+/// Recorded when the session begins, so the landing code reads it instead of
+/// comparing `scanned_path` with `self.root`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum SessionKind {
     /// A scan of the whole tree (`begin`, `R`, a full-refresh drift rescan).
@@ -301,12 +310,12 @@ struct Session {
     /// The thread the finished scan lands on.
     handle: Option<Landing>,
     started: Instant,
-    /// Set when the user stopped this scan from a browsing view rather than
-    /// the scanning screen. There, a cancelled scan keeps its partial tree
-    /// on purpose; here the whole point is that the folder you were already
-    /// looking at is left as it was — the partial result is discarded once
-    /// the thread joins instead of grafted in. Folders a focus scan filled in
-    /// during it keep their fresh counts.
+    /// Set when `z` stops a subtree scan, or the scan correcting a snapshot
+    /// painted for a new place. A stopped root rescan keeps its partial tree;
+    /// these leave what is on screen as it was — the partial result is
+    /// discarded once the thread joins instead of grafted in, unless a
+    /// whole-tree scan finished counting before the stop reached it. Folders a
+    /// focus scan filled in during it keep their fresh counts.
     discard_on_finish: bool,
 }
 
@@ -489,6 +498,12 @@ fn join_in_background<T: Send + 'static>(handle: JoinHandle<T>) {
 /// partial count to stop at any more, only the rest of the landing.
 pub const FINISHING: &str = "finishing — the count is done…";
 
+/// Said while a stopped rescan's partial count is on its way.
+const STOPPED_SHORT: &str = "stopping — showing what was counted so far";
+
+/// Said while a stopped scan whose result is discarded winds down.
+const STOPPING: &str = "stopping the background scan…";
+
 /// What a cached list for the folder on screen was built from. While none of
 /// it has moved, the list is still the right one.
 #[derive(Clone, PartialEq, Eq)]
@@ -631,6 +646,9 @@ pub struct App {
     /// When the numbers on screen came from a stored snapshot rather than the
     /// scan that is still running: the moment that snapshot was taken.
     pub provisional: Option<u64>,
+    /// Set when `z` stopped that scan: the snapshot stays on screen, and
+    /// nothing is coming to correct it until the next whole-tree scan.
+    pub snapshot_kept: bool,
     /// Directories the running scan has finished counting, largest first.
     pub streamed: Vec<Finished>,
     /// A deletion in flight.
@@ -648,6 +666,9 @@ pub struct App {
     /// Folders a focus scan grafted into the tree during the running
     /// session; their counts are fresh, not the snapshot's or the stub's.
     focus_grafted: Vec<PathBuf>,
+    /// Folders counted afresh, by a focus scan or an `r` rescan, during
+    /// sessions that ended while a snapshot stayed on screen.
+    counted_since_snapshot: Vec<PathBuf>,
     mode: ScanMode,
     /// How many times the tree behind the view has been replaced or edited.
     revision: u64,
@@ -703,6 +724,7 @@ impl App {
             outcomes: Vec::new(),
             read_only: false,
             provisional: None,
+            snapshot_kept: false,
             streamed: Vec::new(),
             deleting: None,
             tick: 0,
@@ -711,6 +733,7 @@ impl App {
             focus_refused: None,
             focus_boundaries: scan::MountBoundaries::default(),
             focus_grafted: Vec::new(),
+            counted_since_snapshot: Vec::new(),
             mode: ScanMode::Fresh,
             revision: 0,
             radial: Recent::big(),
@@ -758,7 +781,7 @@ impl App {
     }
 
     /// Scan the same place again without disturbing the view — what watch mode
-    /// does on every tick, and what `r` does on demand.
+    /// does on every tick, and what `R` (or `r` at the root) does on demand.
     pub fn refresh(&mut self) {
         if self.root.as_os_str().is_empty() || self.session.is_some() || self.deleting.is_some() {
             return;
@@ -891,6 +914,8 @@ impl App {
             self.status = None;
             self.streamed.clear();
             self.provisional = None;
+            self.focus_grafted.clear();
+            self.counted_since_snapshot.clear();
             self.view = View::Scanning;
 
             // Paint what disko knew last time straight away, clearly labelled,
@@ -933,10 +958,9 @@ impl App {
             self.settings.scan_options.clone(),
             stream_depth,
         );
-        // `rescan_root`/`refresh`'s own guard keeps this from firing on top
-        // of a live session, but `Fresh` reaches `begin` straight from the
-        // Picker (`pick_selected_filesystem`) with no such guard: a session
-        // could still be running against the place just left. Cancel its
+        // Defensive: every caller today reaches here with no session running
+        // (`refresh` refuses while one does, and the Picker is only entered
+        // after the session was dropped). Should one still be live, cancel its
         // token before it is dropped, or the detached thread keeps scanning
         // an abandoned root to a result nothing will ever read.
         if let Some(previous) = self.session.take() {
@@ -948,9 +972,10 @@ impl App {
         // A focus scan belongs to the tree it was grafting into, now replaced.
         self.drop_focus();
         self.focus_boundaries = scan::MountBoundaries::default();
-        self.focus_grafted.clear();
+        self.forget_focus_grafts();
         let compare = self.compare_for(SessionKind::Root);
         let landing = land_in_background(handle, compare);
+        self.snapshot_kept = false;
         self.session = Some(Session {
             scanned_path: path,
             kind: SessionKind::Root,
@@ -1045,7 +1070,7 @@ impl App {
         {
             return false;
         }
-        self.provisional.is_some()
+        self.provisional.is_some() && !self.snapshot_kept
             || self
                 .scanned_path()
                 .is_some_and(|scanned| self.cwd.starts_with(scanned))
@@ -1066,7 +1091,12 @@ impl App {
     /// for another reason — past what a focus scan keeps, pruned from a
     /// snapshot or stub, or cut short by a stop.
     pub fn cwd_listing(&self) -> Listing {
-        if self.cwd_shortfall().is_none() {
+        if self
+            .current_entry()
+            .is_some_and(|entry| entry.scan_state() == ScanState::Skipped)
+        {
+            Listing::Skipped
+        } else if self.cwd_shortfall().is_none() {
             Listing::Complete
         } else if self.subtree_scan_options(&self.cwd).max_depth == Some(0) {
             // `r` would keep nothing below here either.
@@ -1114,14 +1144,26 @@ impl App {
     }
 
     /// When the screen shows a stored snapshot, the time it was taken — unless
-    /// the folder on screen has been counted afresh since, by a focus scan.
+    /// the folder on screen has been counted afresh since, by a focus scan or
+    /// an `r` rescan.
     pub fn provisional_for_cwd(&self) -> Option<u64> {
         self.provisional.filter(|_| {
             !self
                 .focus_grafted
                 .iter()
+                .chain(&self.counted_since_snapshot)
                 .any(|path| self.cwd.starts_with(path))
         })
+    }
+
+    /// A new session starts its own list of focus grafts. Under a snapshot,
+    /// the folders the last one counted keep their fresh label.
+    fn forget_focus_grafts(&mut self) {
+        if self.provisional.is_some() {
+            self.counted_since_snapshot.append(&mut self.focus_grafted);
+        } else {
+            self.focus_grafted.clear();
+        }
     }
 
     /// Scan only a subtree in the background and graft the result into the current tree.
@@ -1152,22 +1194,20 @@ impl App {
         // would silently swap in a different subtree. A path `canonicalize`
         // cannot resolve at all (already gone, a permission error on an
         // ancestor) is not that case, so it still gets a rescan attempt and
-        // fails there with its own message instead of here.
-        let canonical = match path.canonicalize() {
-            Ok(canonical) if canonical != path => {
-                self.status = Some(format!(
-                    "{} now points somewhere else — go back and open it again",
-                    model::display_path(&path)
-                ));
-                return;
-            }
-            Ok(canonical) => canonical,
-            Err(_) => path.clone(),
-        };
+        // fails there with its own message instead of here. The scan thread
+        // checks the same before walking; this says it with a way out.
+        if path.canonicalize().is_ok_and(|canonical| canonical != path) {
+            self.status = Some(format!(
+                "{} now points somewhere else — go back and open it again",
+                model::display_path(&path)
+            ));
+            return;
+        }
         let options = self.subtree_scan_options(&path);
-        let (progress, cancel, handle) = scan::scan_in_background(canonical, options);
+        let (progress, cancel, handle) =
+            scan::scan_in_background_within(path.clone(), self.root.clone(), options);
         self.focus_boundaries = scan::MountBoundaries::default();
-        self.focus_grafted.clear();
+        self.forget_focus_grafts();
         let landing = land_in_background(handle, self.compare_for(SessionKind::Subtree));
         self.session = Some(Session {
             scanned_path: path,
@@ -1217,13 +1257,29 @@ impl App {
         };
         let scanned_path = session.scanned_path.clone();
         let kind = session.kind;
-        let discard = session.discard_on_finish;
+        let stopped = session.discard_on_finish;
         let joined = landing.handle.join();
+        // A whole-tree stop that came too late to cut the count short lands
+        // whole, like any finished scan, rather than throwing its count away.
+        let landed_whole = kind == SessionKind::Root
+            && matches!(&joined, Ok(Ok(landed)) if landed.tree.scan_state() != ScanState::Cancelled);
+        if stopped && landed_whole && self.status.as_deref() == Some(STOPPING) {
+            self.status = None;
+        }
+        let discard = stopped && !landed_whole;
         if discard {
-            // A stopped folder rescan: drop its partial result and keep the
-            // folder on screen as it was — apart from folders opened during
-            // it, which a focus scan already filled in with fresh counts.
-            self.status = Some(if !self.focus_grafted.is_empty() {
+            // A stopped folder rescan, or a stopped scan over a snapshot: drop
+            // its partial result and keep what is on screen as it was — apart
+            // from folders opened during it, which a focus scan already filled
+            // in with fresh counts.
+            let snapshot = self.provisional.filter(|_| kind == SessionKind::Root);
+            self.snapshot_kept |= snapshot.is_some();
+            self.status = Some(if let Some(taken_at) = snapshot {
+                format!(
+                    "stopped — showing the snapshot from {}",
+                    crate::timefmt::ago(disko_core::history::now().saturating_sub(taken_at))
+                )
+            } else if !self.focus_grafted.is_empty() {
                 format!(
                     "stopped — {} unchanged, except folders opened meanwhile",
                     model::display_path(&scanned_path)
@@ -1232,6 +1288,12 @@ impl App {
                 format!("stopped — {} unchanged", model::display_path(&scanned_path))
             });
             self.session = None;
+            // A stopped whole-tree scan is a watch round, as a failed one is.
+            if kind == SessionKind::Root
+                && let Some(watch) = &mut self.watch
+            {
+                watch.last_scan = Instant::now();
+            }
             self.keep_focus_grafts_as_a_change();
             self.drop_focus();
             if let Ok(Ok(landed)) = joined {
@@ -1240,6 +1302,7 @@ impl App {
             return;
         }
         let mut applied = false;
+        let mut failure = None;
         match joined {
             Ok(Ok(landed)) => {
                 if kind == SessionKind::Root {
@@ -1252,7 +1315,11 @@ impl App {
                     match grafted {
                         Ok(replaced) => {
                             drop_in_background(replaced);
+                            if self.provisional.is_some() {
+                                self.counted_since_snapshot.push(scanned_path.clone());
+                            }
                             self.finish_tree_mutation();
+                            self.step_out_of_a_vanished_folder();
                             let rows = self.rows().len();
                             self.selection = self.selection.min(rows.saturating_sub(1));
                             applied = true;
@@ -1267,31 +1334,20 @@ impl App {
                     }
                 }
             }
-            Ok(Err(error)) => {
-                self.status = Some(format!("{error}"));
-                if kind == SessionKind::Root {
-                    self.view = View::Picker;
-                }
-                // A failed root scan leaves nothing new to compare against, so
-                // treat it the way a finished one moves the clock — without
+            Ok(Err(error)) => failure = Some(format!("{error}")),
+            // A panicked worker must not take the UI down with it.
+            Err(_) => failure = Some("scan thread panicked".to_string()),
+        }
+        if let Some(failure) = failure {
+            self.status = Some(failure);
+            if kind == SessionKind::Root {
+                self.view = View::Picker;
+                // A failed root scan leaves nothing new to compare against,
+                // so treat it the way a finished one moves the clock — without
                 // this, `is_due()` stays true and `tick_watch` starts another
                 // one on the very next frame instead of waiting out the
                 // interval. A failed folder rescan is not a watch round.
-                if kind == SessionKind::Root
-                    && let Some(watch) = &mut self.watch
-                {
-                    watch.last_scan = Instant::now();
-                }
-            }
-            // A panicked worker must not take the UI down with it.
-            Err(_) => {
-                self.status = Some("scan thread panicked".to_string());
-                if kind == SessionKind::Root {
-                    self.view = View::Picker;
-                }
-                if kind == SessionKind::Root
-                    && let Some(watch) = &mut self.watch
-                {
+                if let Some(watch) = &mut self.watch {
                     watch.last_scan = Instant::now();
                 }
             }
@@ -1360,10 +1416,7 @@ impl App {
             || self.cwd == scanned
             || !self.cwd.starts_with(&scanned)
             || self.focus.as_ref().is_some_and(|f| f.path == self.cwd)
-            || self
-                .focus_refused
-                .as_ref()
-                .is_some_and(|(path, revision)| *path == self.cwd && *revision == self.revision)
+            || self.cwd_focus_refused()
             || self.cwd_shortfall().is_none()
         {
             return;
@@ -1574,14 +1627,17 @@ impl App {
             drop_in_background(previous);
         }
         self.changed_since_scan = false;
-        // A stop that came too late to cut the count short said so; the full
-        // count is here now.
-        if self.status.as_deref() == Some(FINISHING) {
+        // A stop that came too late to cut the count short said so, or
+        // promised a partial count; the full count is here now.
+        if self.status.as_deref() == Some(FINISHING)
+            || !cancelled && self.status.as_deref() == Some(STOPPED_SHORT)
+        {
             self.status = None;
         }
         self.touch();
         // Whatever is on screen is now the real thing.
         self.provisional = None;
+        self.counted_since_snapshot.clear();
         self.streamed.clear();
         // A view already on screen (a snapshot painted while the scan ran)
         // stays whichever one the user stepped to.
@@ -1603,11 +1659,6 @@ impl App {
         self.tick
     }
 
-    /// True while the screen is showing last-known numbers.
-    pub fn is_provisional(&self) -> bool {
-        self.provisional.is_some() && self.session.is_some()
-    }
-
     /// Switch between "what is big" and "what changed".
     pub fn toggle_metric(&mut self) {
         if self.diff.is_none() {
@@ -1623,6 +1674,16 @@ impl App {
                 } else {
                     "waiting for the next rescan".into()
                 }
+            } else if self.snapshot_kept
+                || self.provisional.is_some()
+                    && self
+                        .session
+                        .as_ref()
+                        .is_some_and(|session| session.discard_on_finish)
+            {
+                "scan was stopped — R rescans and compares".into()
+            } else if self.provisional.is_some() && self.session.is_some() {
+                "comparing with the snapshot once this scan lands".into()
             } else if self.changed_since_scan {
                 "totals changed since the scan — R rescans and compares again".into()
             } else if self.settings.record_snapshots {
@@ -1655,9 +1716,10 @@ impl App {
         }
     }
 
-    /// Stop a background scan (`r`, `R`, or the automatic rescan after a
-    /// drifted deletion) from the browsing views. Also re-enables deletion,
-    /// which a running scan otherwise refuses.
+    /// Stop a background scan (`r`, `R`, the automatic rescan after a drifted
+    /// deletion, or the scan correcting a snapshot) from the browsing views.
+    /// Also re-enables deletion, which a running scan otherwise refuses,
+    /// unless a snapshot stays on screen.
     ///
     /// A subtree scan (`r`, or a drift rescan scoped to one directory) still
     /// has the pre-scan folder to fall back on, so the folder already on
@@ -1675,11 +1737,11 @@ impl App {
     /// snapshot records or what a mark or deletion sees, and watch mode's
     /// clock moves the same way a finished scan moves it instead of firing
     /// again the moment this frame ends.
+    ///
+    /// A scan of a new place painted from a snapshot trimmed nothing, and the
+    /// snapshot shows more than a stopped count would, so that stop is
+    /// discarded like a folder rescan's and the snapshot stays.
     pub fn cancel_background_scan(&mut self) {
-        if self.provisional.is_some() {
-            self.status = Some("still painting last-known numbers — wait for the scan".into());
-            return;
-        }
         if self.scan_counted()
             && self
                 .session
@@ -1692,14 +1754,18 @@ impl App {
         let Some(session) = &mut self.session else {
             return;
         };
-        if session.kind == SessionKind::Root {
+        // Over a snapshot painted for a new place, what the scan counted so far
+        // is less than the snapshot already shows: keep the snapshot and drop
+        // the partial count. A rescan trimmed what it rescans, so it lands.
+        let over_snapshot = self.provisional.is_some() && self.mode == ScanMode::Fresh;
+        if session.kind == SessionKind::Root && !over_snapshot {
             session.cancel.cancel();
-            self.status = Some("stopping — showing what was counted so far".into());
+            self.status = Some(STOPPED_SHORT.into());
             return;
         }
         session.cancel.cancel();
         session.discard_on_finish = true;
-        self.status = Some("stopping the background scan…".into());
+        self.status = Some(STOPPING.into());
     }
 
     /// Whether the running scan has counted everything and is only being
@@ -1886,6 +1952,11 @@ impl App {
         }
         if self.session.is_some() {
             self.status = Some("wait for the scan to finish before deleting".into());
+            return;
+        }
+        // A snapshot records no file identities to check a deletion against.
+        if self.provisional.is_some() {
+            self.status = Some("showing a snapshot — press R to rescan before deleting".into());
             return;
         }
         let Some(tree) = &self.tree else { return };
@@ -2318,11 +2389,6 @@ impl App {
         parts
     }
 
-    /// Breadcrumb for the explorer: `Macintosh HD › Users › cesar`.
-    pub fn breadcrumb(&self) -> String {
-        self.breadcrumb_parts().join(" › ")
-    }
-
     /// The sunburst for the current directory, plus the table taking a path
     /// back to the wedge that stands for it.
     ///
@@ -2753,19 +2819,6 @@ mod tests {
     }
 
     #[test]
-    fn rescanning_drops_the_old_tree_down_to_the_stub() {
-        let mut app = app_with_tree();
-        app.cwd = PathBuf::from("/disko-test-root");
-        app.begin(&PathBuf::from("/disko-test-root"), ScanMode::Refresh);
-
-        // The rescan is under way and the view still has its numbers, but the
-        // full tree is no longer being held alongside the one being built.
-        let tree = app.tree.as_ref().expect("the view keeps something to draw");
-        assert_eq!(tree.allocated_size, 1000);
-        assert_eq!(app.rows().len(), 2);
-    }
-
-    #[test]
     fn opening_a_directory_descends_and_resets_the_selection() {
         let mut app = app_with_tree();
         app.selection = 1;
@@ -2830,9 +2883,9 @@ mod tests {
     #[test]
     fn the_breadcrumb_follows_the_current_directory() {
         let mut app = app_with_tree();
-        assert_eq!(app.breadcrumb(), "/disko-test-root");
+        assert_eq!(app.breadcrumb_parts(), ["/disko-test-root"]);
         app.cwd = PathBuf::from("/disko-test-root/big/inner");
-        assert_eq!(app.breadcrumb(), "/disko-test-root › big › inner");
+        assert_eq!(app.breadcrumb_parts(), ["/disko-test-root", "big", "inner"]);
     }
 
     /// A fresh scan opens on the saved view, but only if nothing is on screen
@@ -3460,39 +3513,42 @@ mod tests {
     }
 
     #[test]
-    fn subtree_graft_updates_deep_branch_and_preserves_root() {
-        let mut app = app_with_tree();
-        let mut inner_graft = DiskEntry::new(
-            PathBuf::from("/disko-test-root/big/inner"),
-            EntryType::Directory,
-        );
-        let mut new_file = DiskEntry::new("nested.txt", EntryType::File);
-        new_file.allocated_size = 800;
-        new_file.apparent_size = 800;
-        new_file.items = 1;
-        inner_graft.children.push(new_file);
-        inner_graft.allocated_size = 800;
-        inner_graft.apparent_size = 800;
-        inner_graft.items = 2;
+    fn a_rescan_that_no_longer_finds_the_folder_on_screen_climbs_out_of_it() {
+        let base = std::env::temp_dir().join(format!("disko-vanished-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("a")).unwrap();
+        let base = base.canonicalize().unwrap();
+        let path = |rel: &str| base.join(rel).to_string_lossy().into_owned();
+        let mut app = App::new(settings(), false);
+        app.root = base.clone();
+        app.tree = Some(entry(
+            &path(""),
+            10,
+            vec![entry(&path("a"), 10, vec![entry(&path("a/b"), 10, vec![])])],
+        ));
+        app.view = View::Overview;
+        // `b` was listed by the last scan and has gone from disk since.
+        app.cwd = base.join("a/b");
 
-        assert!(
-            app.tree
-                .as_mut()
-                .unwrap()
-                .graft(Path::new("/disko-test-root/big/inner"), inner_graft)
-                .is_ok()
-        );
-        assert_eq!(
-            app.tree
-                .as_ref()
-                .unwrap()
-                .resolve(Path::new("/disko-test-root/big/inner/nested.txt"))
-                .unwrap()
-                .allocated_size,
-            800
-        );
-        // Original inner was 500; replaced with 800 (+300). Root was 1000, now 1300.
-        assert_eq!(app.tree.as_ref().unwrap().allocated_size, 1300);
+        app.scan_subtree(base.join("a"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.session.is_some() {
+            assert!(Instant::now() < deadline, "the rescan never landed");
+            app.poll_scan();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(app.cwd, base.join("a"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_skipped_mount_does_not_claim_to_be_empty() {
+        let mut app = app_with_tree();
+        app.tree.as_mut().unwrap().children[1].set_scan_state(ScanState::Skipped);
+        app.cwd = PathBuf::from("/disko-test-root/small");
+
+        assert_eq!(app.cwd_listing(), Listing::Skipped);
     }
 
     #[test]
@@ -3669,7 +3725,8 @@ mod tests {
             app.status
         );
 
-        // Deletion is refused only while `session` is set.
+        // Deletion is refused only while `session` is set or a snapshot is
+        // on screen.
         app.request_delete();
         assert!(
             app.status
@@ -3680,34 +3737,235 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cancelling_z_is_refused_while_the_screen_is_still_provisional() {
-        let mut app = app_with_tree();
-        app.start_scan(Path::new("/disko-test-root"));
-        assert!(app.provisional.is_some() || app.session.is_some());
-        // Force the provisional state directly: whether a snapshot happened
-        // to exist for this path is environment-dependent, but the refusal
-        // must hold whenever the screen is painted from one.
-        app.provisional = Some(0);
+    /// `z` on the scan running under the snapshot on screen, two hours old,
+    /// with `landed` as what that scan had counted when it stopped.
+    fn stop_over_a_snapshot(app: &mut App, landed: DiskEntry) {
+        // Snapshots are painted only for a new place.
+        app.mode = ScanMode::Fresh;
+        app.provisional = Some(disko_core::history::now().saturating_sub(7200));
+        let handle = std::thread::spawn(move || Ok(landed));
+        while !handle.is_finished() {
+            std::thread::yield_now();
+        }
+        app.session = Some(Session {
+            scanned_path: app.root.clone(),
+            kind: SessionKind::Root,
+            progress: Arc::new(Progress::default()),
+            cancel: Cancel::new(),
+            handle: Some(landing(handle, Compare::Nothing)),
+            started: Instant::now(),
+            discard_on_finish: false,
+        });
 
         app.cancel_background_scan();
+        assert!(app.session.as_ref().unwrap().cancel.is_cancelled());
+        app.poll_scan();
+    }
 
-        // `session.is_some()` alone would also hold on the root-cancel path —
-        // `z` leaves `session` set there too, only its cancel token flips —
-        // so check the token itself was never touched.
+    fn stopped_count(size: u64) -> DiskEntry {
+        let mut partial = DiskEntry::new(PathBuf::from("/disko-test-root"), EntryType::Directory);
+        partial.allocated_size = size;
+        partial.apparent_size = size;
+        partial.set_scan_state(ScanState::Cancelled);
+        partial
+    }
+
+    #[test]
+    fn z_over_a_snapshot_stops_the_scan_and_keeps_the_snapshot() {
+        let mut app = app_with_tree();
+        stop_over_a_snapshot(&mut app, stopped_count(400));
+
+        assert!(app.session.is_none());
+        assert_eq!(app.tree.as_ref().unwrap().allocated_size, 1000);
+        assert!(app.provisional.is_some(), "still labelled as a snapshot");
+        assert!(app.snapshot_kept);
+        assert!(!app.cwd_is_being_scanned());
         assert!(
-            app.session
-                .as_ref()
-                .is_some_and(|session| !session.cancel.is_cancelled()),
-            "a provisional screen must not let `z` touch the running session"
+            app.status.as_deref().unwrap().contains("snapshot"),
+            "{:?}",
+            app.status
         );
+
+        app.request_delete();
+        assert!(
+            app.confirm.is_none(),
+            "a snapshot has no identities to delete by"
+        );
+    }
+
+    #[test]
+    fn a_stop_over_a_snapshot_counts_as_a_watch_round() {
+        let mut app = app_with_tree();
+        app.watch = Some(Watch::new(60));
+        app.watch.as_mut().unwrap().last_scan = Instant::now() - Duration::from_secs(120);
+
+        stop_over_a_snapshot(&mut app, stopped_count(400));
+
+        assert!(app.snapshot_kept);
+        assert!(
+            !app.watch.as_ref().unwrap().is_due(),
+            "watch would rescan at once"
+        );
+    }
+
+    #[test]
+    fn a_stop_too_late_to_cut_the_count_lands_the_whole_scan() {
+        let mut app = app_with_tree();
+        let mut whole = DiskEntry::new(PathBuf::from("/disko-test-root"), EntryType::Directory);
+        whole.allocated_size = 400;
+        whole.apparent_size = 400;
+
+        stop_over_a_snapshot(&mut app, whole);
+
+        assert_eq!(app.tree.as_ref().unwrap().allocated_size, 400);
+        assert_eq!(app.provisional, None);
+        assert!(!app.snapshot_kept);
+        assert_eq!(app.status, None);
+    }
+
+    #[test]
+    fn growth_while_a_scan_corrects_the_snapshot_says_it_is_coming() {
+        let mut app = app_with_tree();
+        app.provisional = Some(disko_core::history::now().saturating_sub(7200));
+        app.session = Some(Session {
+            scanned_path: app.root.clone(),
+            kind: SessionKind::Root,
+            progress: Arc::new(Progress::default()),
+            cancel: Cancel::new(),
+            handle: None,
+            started: Instant::now(),
+            discard_on_finish: false,
+        });
+
+        app.toggle_metric();
+
         assert!(
             app.status
                 .as_deref()
-                .is_some_and(|s| !s.contains("stopping")),
-            "status was: {:?}",
+                .unwrap()
+                .contains("once this scan lands"),
+            "{:?}",
             app.status
         );
+    }
+
+    #[test]
+    fn a_rescan_stopped_too_late_drops_its_partial_count_promise() {
+        let mut app = app_with_tree();
+        app.rescan_root();
+        let mut whole = DiskEntry::new(PathBuf::from("/disko-test-root"), EntryType::Directory);
+        whole.allocated_size = 400;
+        hand_over(&mut app, {
+            let handle = std::thread::spawn(move || Ok(whole));
+            while !handle.is_finished() {
+                std::thread::yield_now();
+            }
+            handle
+        });
+        app.session.as_mut().unwrap().progress = Arc::new(Progress::default());
+
+        app.cancel_background_scan();
+        app.poll_scan();
+
+        assert_eq!(app.tree.as_ref().unwrap().allocated_size, 400);
+        assert_eq!(app.status, None);
+    }
+
+    #[test]
+    fn growth_after_a_kept_snapshot_in_watch_mode_waits_for_the_first_round() {
+        let mut app = app_with_tree();
+        app.watch = Some(Watch::new(60));
+        stop_over_a_snapshot(&mut app, stopped_count(400));
+
+        app.toggle_metric();
+
+        assert_eq!(app.status.as_deref(), Some("waiting for the first rescan"));
+    }
+
+    #[test]
+    fn growth_while_a_stopped_scan_winds_down_says_it_was_stopped() {
+        let mut app = app_with_tree();
+        app.provisional = Some(disko_core::history::now().saturating_sub(7200));
+        app.session = Some(Session {
+            scanned_path: app.root.clone(),
+            kind: SessionKind::Root,
+            progress: Arc::new(Progress::default()),
+            cancel: Cancel::new(),
+            handle: None,
+            started: Instant::now(),
+            discard_on_finish: false,
+        });
+        app.cancel_background_scan();
+
+        app.toggle_metric();
+
+        assert!(
+            app.status.as_deref().unwrap().contains("R rescans"),
+            "{:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn growth_after_a_kept_snapshot_points_at_a_rescan() {
+        let mut app = app_with_tree();
+        stop_over_a_snapshot(&mut app, stopped_count(400));
+
+        app.toggle_metric();
+
+        assert!(
+            app.status.as_deref().unwrap().contains("R rescans"),
+            "{:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn a_stopped_rescan_over_a_kept_snapshot_shows_what_it_counted() {
+        let mut app = app_with_tree();
+        stop_over_a_snapshot(&mut app, stopped_count(400));
+
+        // `R` trims the snapshot it rescans, so its stop lands its own count.
+        app.rescan_root();
+        hand_over(&mut app, {
+            let handle = std::thread::spawn(|| Ok(stopped_count(250)));
+            while !handle.is_finished() {
+                std::thread::yield_now();
+            }
+            handle
+        });
+        app.session.as_mut().unwrap().progress = Arc::new(Progress::default());
+        app.cancel_background_scan();
+        app.poll_scan();
+
+        assert!(app.session.is_none());
+        assert_eq!(app.tree.as_ref().unwrap().allocated_size, 250);
+        assert_eq!(app.provisional, None);
+    }
+
+    #[test]
+    fn folders_counted_after_a_kept_snapshot_lose_its_age() {
+        let mut app = app_with_tree();
+        // A focus scan filled `small` in before `z`.
+        app.focus_grafted = vec![PathBuf::from("/disko-test-root/small")];
+        stop_over_a_snapshot(&mut app, stopped_count(400));
+
+        // `r` on `big` counts it afresh.
+        app.scan_subtree(PathBuf::from("/disko-test-root/big"));
+        assert_eq!(app.session.as_ref().unwrap().kind, SessionKind::Subtree);
+        let replacement = entry("/disko-test-root/big", 900, vec![]);
+        let handle = std::thread::spawn(move || Ok(replacement));
+        while !handle.is_finished() {
+            std::thread::yield_now();
+        }
+        hand_over(&mut app, handle);
+        app.poll_scan();
+        assert!(app.session.is_none());
+
+        for (folder, fresh) in [("big", true), ("small", true), ("", false)] {
+            app.cwd = Path::new("/disko-test-root").join(folder);
+            assert_eq!(app.provisional_for_cwd().is_none(), fresh, "{folder:?}");
+        }
     }
 
     #[test]
@@ -3777,6 +4035,14 @@ mod tests {
 
         assert!(status.starts_with("deletion incomplete"), "{status}");
         assert!(status.contains("interrupted"), "{status}");
+        assert!(status.contains("after removing 1 entry"), "{status}");
+
+        // Others deleted first: the half-removed item is still not "skipped".
+        for skipped in [1, 3] {
+            let status = deletion_status(1, skipped, 10, &outcomes, Unit::Decimal);
+            assert!(status.contains("deletion incomplete"), "{status}");
+            assert!(!status.contains("skipped"), "{status}");
+        }
     }
 
     #[test]
@@ -3807,6 +4073,10 @@ mod tests {
         let base =
             std::env::temp_dir().join(format!("disko-scan-subtree-symlink-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        // `/var` and `/private/var` are one place on macOS; without this the
+        // path would never match its canonical form, swapped or not.
+        let base = base.canonicalize().unwrap();
         let original = base.join("original");
         let elsewhere = base.join("elsewhere");
         fs::create_dir_all(&original).unwrap();
@@ -3964,16 +4234,7 @@ mod tests {
 
         assert!(app.focus.is_none());
         assert!(token.is_cancelled());
-        // The root scan's tree has no `deep`; nothing may graft it back.
         drop(focus_release);
-        app.poll_scan();
-        assert!(
-            app.tree
-                .as_ref()
-                .unwrap()
-                .resolve(&base.join("deep"))
-                .is_none()
-        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -4665,6 +4926,8 @@ mod tests {
         let base =
             std::env::temp_dir().join(format!("disko-refresh-symlink-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let base = base.canonicalize().unwrap();
         let original = base.join("original");
         let elsewhere = base.join("elsewhere");
         fs::create_dir_all(&original).unwrap();

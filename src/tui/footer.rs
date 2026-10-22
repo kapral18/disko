@@ -52,8 +52,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Shown in Overview/Explorer only while a background scan (`r`, `R`, or the
-/// automatic rescan after a drifted deletion) is actually running.
+/// Shown in Overview/Explorer only while a scan behind the screen (`r`, `R`,
+/// the automatic rescan after a drifted deletion, or the scan correcting a
+/// snapshot) is actually running.
 const STOP_SCAN: Hint = ("z", "stop scan");
 
 /// Fit as many hints as the width allows, dropping the least important first
@@ -143,13 +144,8 @@ fn hints_for(app: &App) -> Vec<Hint> {
         View::Scanning => vec![],
     };
     // Only worth a key hint while there is something to stop; browsing is the
-    // normal case and a background scan is the exception. `z` is refused
-    // outright while the screen is still painted from a snapshot rather than
-    // the scan in progress, so the hint stays hidden for the same stretch.
-    if matches!(app.view, View::Overview | View::Explorer)
-        && app.progress().is_some()
-        && app.provisional.is_none()
-    {
+    // normal case and a background scan is the exception.
+    if matches!(app.view, View::Overview | View::Explorer) && app.progress().is_some() {
         hints.insert(2, STOP_SCAN);
     }
     hints
@@ -178,7 +174,7 @@ fn status(app: &App, tick: usize) -> String {
             "{} scanning{} {} items · {}",
             theme::spinner(tick),
             folder,
-            progress.entries(),
+            crate::output::count(progress.entries()),
             format(progress.bytes(), app.settings.unit)
         )
     } else if let Some(watch) = &app.watch {

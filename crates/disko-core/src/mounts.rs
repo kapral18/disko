@@ -129,10 +129,58 @@ pub fn is_remote(fs_type: &str) -> bool {
 
 /// Every mount point that is not really on this disk.
 pub fn remote_mount_points() -> Vec<PathBuf> {
-    list(true)
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let mounts = kernel_mounts();
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let mounts = list(true)
         .into_iter()
-        .filter(|fs| is_remote(&fs.fs_type))
-        .map(|fs| fs.mount_point)
+        .map(|fs| (fs.fs_type, fs.mount_point));
+    mounts
+        .into_iter()
+        .filter(|(fs_type, _)| is_remote(fs_type))
+        .map(|(_, mount_point)| mount_point)
+        .collect()
+}
+
+/// Every mount's filesystem type and mount point, as the kernel lists them.
+/// sysinfo leaves out volumes that are not local (SMB, NFS and AFP shares),
+/// which are exactly the ones a scan has to stop at. `MNT_NOWAIT` answers from
+/// cached state, so a share whose server is gone does not hang the call.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn kernel_mounts() -> Vec<(String, PathBuf)> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    // SAFETY: a null buffer asks only for the number of mounts.
+    let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    let Ok(count) = usize::try_from(count) else {
+        return Vec::new();
+    };
+    // SAFETY: `statfs` is plain data, for which all-zero bytes are valid.
+    let mut raw = vec![unsafe { std::mem::zeroed::<libc::statfs>() }; count];
+    let Ok(size) = libc::c_int::try_from(count * std::mem::size_of::<libc::statfs>()) else {
+        return Vec::new();
+    };
+    // SAFETY: `raw` holds `count` entries, and `size` is their size in bytes.
+    let filled = unsafe { libc::getfsstat(raw.as_mut_ptr(), size, libc::MNT_NOWAIT) };
+    let Ok(filled) = usize::try_from(filled) else {
+        return Vec::new();
+    };
+    raw.truncate(filled);
+    raw.iter()
+        .map(|fs| {
+            // SAFETY: the kernel fills both as NUL-terminated strings.
+            let (fs_type, mount_point) = unsafe {
+                (
+                    CStr::from_ptr(fs.f_fstypename.as_ptr()),
+                    CStr::from_ptr(fs.f_mntonname.as_ptr()),
+                )
+            };
+            (
+                fs_type.to_string_lossy().into_owned(),
+                PathBuf::from(OsStr::from_bytes(mount_point.to_bytes())),
+            )
+        })
         .collect()
 }
 
@@ -149,12 +197,21 @@ pub(crate) fn scan_boundaries(skip_remote: bool) -> (Vec<PathBuf>, Vec<PathBuf>)
     (remote, pseudo_mount_points())
 }
 
-/// One listing serves both: on macOS it takes about 50 ms.
+/// One listing serves both, except that on macOS it holds no network shares,
+/// so those come from the kernel's own list.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn scan_boundaries(skip_remote: bool) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let remote = if skip_remote {
+        remote_mount_points()
+    } else {
+        Vec::new()
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     let mut remote = Vec::new();
     let mut pseudo = Vec::new();
     for fs in list(true) {
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         if skip_remote && is_remote(&fs.fs_type) {
             remote.push(fs.mount_point.clone());
         }
@@ -397,7 +454,6 @@ fn collect() -> Vec<Filesystem> {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Clone)]
 struct MountRow {
     device: String,
     mount_point: PathBuf,
@@ -405,20 +461,8 @@ struct MountRow {
     options: String,
 }
 
-#[cfg(all(test, target_os = "linux"))]
-std::thread_local! {
-    static TEST_PROC_MOUNTS: std::cell::RefCell<Option<Vec<MountRow>>> = const {
-        std::cell::RefCell::new(None)
-    };
-}
-
 #[cfg(target_os = "linux")]
 fn read_proc_mounts() -> Vec<MountRow> {
-    #[cfg(test)]
-    if let Some(rows) = TEST_PROC_MOUNTS.with(|override_| override_.borrow().clone()) {
-        return rows;
-    }
-
     let Ok(contents) = std::fs::read_to_string("/proc/mounts") else {
         return Vec::new();
     };
@@ -600,45 +644,9 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    struct ProcMountsOverride(Option<Vec<MountRow>>);
-
-    #[cfg(target_os = "linux")]
-    impl Drop for ProcMountsOverride {
-        fn drop(&mut self) {
-            TEST_PROC_MOUNTS.with(|override_| {
-                *override_.borrow_mut() = self.0.take();
-            });
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn with_proc_mounts<T>(rows: Vec<MountRow>, f: impl FnOnce() -> T) -> T {
-        let previous = TEST_PROC_MOUNTS.with(|override_| override_.replace(Some(rows)));
-        let _override = ProcMountsOverride(previous);
-        f()
-    }
-
-    #[cfg(target_os = "linux")]
     #[test]
-    fn pseudo_mount_points_reads_the_proc_mount_source() {
-        let rows = vec![
-            MountRow {
-                device: "/dev/root".into(),
-                mount_point: PathBuf::from("/"),
-                fs_type: "ext4".into(),
-                options: "rw".into(),
-            },
-            MountRow {
-                device: "proc".into(),
-                mount_point: PathBuf::from("/proc"),
-                fs_type: "proc".into(),
-                options: "rw".into(),
-            },
-        ];
-
-        let mounts = with_proc_mounts(rows, pseudo_mount_points);
-
-        assert_eq!(mounts, vec![PathBuf::from("/proc")]);
+    fn pseudo_mount_points_come_from_the_live_mount_table() {
+        assert!(pseudo_mount_points().contains(&PathBuf::from("/proc")));
     }
 
     #[cfg(target_os = "linux")]
@@ -723,6 +731,16 @@ mod tests {
             pseudo_mount_points_from_rows(rows),
             vec![PathBuf::from("/snap/core/1")]
         );
+    }
+
+    /// sysinfo lists neither devfs nor network shares; the kernel lists both.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_kernel_lists_mounts_sysinfo_leaves_out() {
+        let mounts = kernel_mounts();
+
+        assert!(mounts.contains(&("devfs".to_string(), PathBuf::from("/dev"))));
+        assert!(mounts.iter().any(|(_, mount)| mount == Path::new("/")));
     }
 
     #[test]

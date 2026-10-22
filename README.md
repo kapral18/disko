@@ -137,7 +137,7 @@ and corrects itself as the fresh scan lands a fraction of a second later (shown
 here in the list view):
 
 ```text
- Current folder: ~/code    78 GB    as of 2 hours ago · rescanning…
+ Current folder: ~/code    78 GB    as of 2 hours ago · ⠋ rescanning…
 
    41 GB  monorepo   ████████████████▉   52.7%
    18 GB  .cache     ███████▋            23.6%
@@ -228,8 +228,9 @@ and `h` / `←` to go up. Press `Tab` to switch between the chart and this list:
 ```
 
 The view you pick with `Tab` stays in place across scans and disk changes.
-It is saved when you quit, to `~/.config/disko/view`
-(`~/Library/Application Support/disko/view` on macOS), and restored next time.
+It is saved when you quit, to `disko/view` in your config directory
+(`$XDG_CONFIG_HOME` or `~/.config` on Linux, `~/Library/Application Support` on
+macOS, `%APPDATA%` on Windows), and restored next time.
 
 | Key | Does |
 | --- | --- |
@@ -237,7 +238,7 @@ It is saved when you quit, to `~/.config/disko/view`
 | `Tab` | switch between chart and list |
 | `Enter` | open the radial explorer (and drill in, once there) |
 | `l` `→` / `h` `←` `Backspace` | open the selected folder / go back up |
-| `Esc` | close details or search, step from the chart to the list, then back to the disk list |
+| `Esc` | close details or search, step from the chart to the list, then back to the disk list if you came from it |
 | **`t`** | **switch between size and growth** |
 | `/` | filter the list as you type |
 | `s` | cycle sort: size, name, item count |
@@ -258,7 +259,10 @@ runs; press `z` to stop it. A stopped folder rescan leaves the folder as it
 was, except folders you opened while it ran (below). A stopped whole-tree
 rescan shows what it counted so far, marked incomplete, with no growth
 comparison; if it never listed the folder you are in, you are moved up to the
-nearest one it did. A `z` that comes after a whole-tree rescan has finished
+nearest one it did. Stopping the scan that corrects the snapshot disko opens
+with leaves the snapshot on screen, labelled with its age; deleting waits for a
+full rescan (`R`), since a snapshot cannot tell whether a file is still the one
+it recorded. A `z` that comes after a whole-tree rescan has finished
 counting stops nothing: disko says it is finishing, and the full result lands,
 with its comparison if there is one. Quitting right then waits until that
 scan's snapshot is saved (`q` again skips it). A folder disko did not fully
@@ -308,20 +312,21 @@ crash:
  └──────────────────────────────────────────────────────────────┘
 ```
 
-`Esc` stops it after the file it is on, and reports which items it never
-reached. Every path
-is re-checked against the filesystem immediately before removal, so disko will
-refuse the scan root, anything outside the current scan, a mount point, or
-something that has vanished since the scan. Symlinks are unlinked, never
-followed into.
+`Esc` stops it after the file it is on (on Windows, between items), and reports
+which items it never reached. Every path is re-checked against the filesystem
+immediately before removal, so disko will refuse the scan root, anything
+outside the current scan, a mount point or a folder with another filesystem
+mounted inside it, and something that has vanished since the scan (or, on Unix,
+been replaced). Symlinks are unlinked, never followed into. `x` is refused
+while a scan runs.
 
 Totals usually correct themselves instantly, by subtracting what was removed.
-When a deletion fails, stops part-way, or frees more than the tree expected (a
-file grew since the scan), disko rescans only the parent directory, in the
-background. When it frees less than expected, or unlinks a file that a hard
-link outside what was deleted still holds and then fails or frees a different
-amount than expected, the missing bytes could be anywhere, so disko rescans the
-whole tree. `x` is refused while that rescan runs; press `z` to stop it.
+When a deletion fails or stops after removing something, or frees more than the
+tree expected (a file grew since the scan), disko rescans only the parent
+directory, in the background. When it frees less than expected, or unlinks a
+file that another hard link still held at the time and then fails or frees a
+different amount than expected, the missing bytes could be anywhere, so disko
+rescans the whole tree. Press `z` to stop that rescan.
 
 `disko --read-only` removes the ability entirely.
 
@@ -388,13 +393,14 @@ $ disko /mnt --plain          # a blobfuse2 mount lives under here
 Pass `--remote` to walk them anyway. Naming a network mount as the scan root
 still scans it — asking for it is asking for it.
 
-The same goes for mounts that hold operating-system internals rather than your
-files: on Linux, pseudo filesystems such as `proc`, `sysfs`, `tmpfs` (`/tmp`
-included, where it is tmpfs), `overlay`, `squashfs` and snap mounts; on macOS,
-`/dev`, `/Volumes` and `/System/Volumes`. They show up in the tree as skipped,
-and naming one as the scan root still scans it. A mount point is judged by
-what is mounted there now, so a real filesystem mounted over an autofs
-placeholder (a systemd automount on `/boot`, say) is walked.
+Mounts and system folders that hold operating-system internals rather than your
+files are skipped too, and `--remote` does not change that: on Linux, pseudo
+filesystems such as `proc`, `sysfs`, `tmpfs` (`/tmp` included, where it is
+tmpfs), `overlay`, `squashfs` and snap mounts; on macOS, `/dev`, `/Volumes` and
+`/System/Volumes`. They show up in the tree as skipped, and naming one as the
+scan root still scans it. A mount point is judged by what is mounted there now,
+so a real filesystem mounted over an autofs placeholder (a systemd automount on
+`/boot`, say) is walked.
 
 Note that `--depth` limits what is *kept*, not what is *walked*: sizes stay
 exact, so it does not make a slow mount fast.

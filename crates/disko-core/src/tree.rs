@@ -30,7 +30,8 @@ pub enum ScanState {
     Denied,
     /// The user stopped the scan before this subtree finished.
     Cancelled,
-    /// Deliberately not descended into (other filesystem, depth limit).
+    /// Deliberately not descended into: another filesystem with `-x`, or a
+    /// network or system mount.
     Skipped,
 }
 
@@ -218,24 +219,8 @@ impl DiskEntry {
     }
 
     /// `path` relative to this entry, or `None` when it lives elsewhere.
-    /// Handles prefix aliases (like `/var` vs `/private/var` on macOS).
     fn relative_path<'a>(&self, path: &'a Path) -> Option<&'a Path> {
-        if let Ok(relative) = path.strip_prefix(self.root_path()) {
-            return Some(relative);
-        }
-
-        // macOS exposes /var, /tmp, and /etc both with and without `/private`
-        // while canonicalisation stores the `/private` form in the scan tree.
-        #[cfg(target_os = "macos")]
-        if let Ok(alias_root) = self.root_path().strip_prefix("/private")
-            && alias_root.components().next().is_some_and(|component| {
-                matches!(component.as_os_str().to_str(), Some("var" | "tmp" | "etc"))
-            })
-            && let Ok(relative) = path.strip_prefix(Path::new("/").join(alias_root))
-        {
-            return Some(relative);
-        }
-        None
+        path.strip_prefix(self.root_path()).ok()
     }
 
     /// The child names under this entry that lead to `path`, for the mutating
@@ -779,8 +764,10 @@ mod tests {
 
     #[test]
     fn a_round_trip_keeps_the_metadata_needed_for_later_removal() {
+        // The root's own mtime is older than its child's, so only a wire that
+        // keeps the root's own value can give it back after the removal.
         let mut root = DiskEntry::new("/root", EntryType::Directory);
-        root.set_modified(10);
+        root.set_modified(5);
         root.set_scan_state(ScanState::Complete);
         let mut child = DiskEntry::new("child", EntryType::Directory);
         child.set_modified(10);
@@ -790,9 +777,10 @@ mod tests {
 
         let json = serde_json::to_string(&root).unwrap();
         let mut back: DiskEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.modified(), 10);
         back.remove(Path::new("/root/child")).unwrap();
 
-        assert_eq!(back.modified(), 10);
+        assert_eq!(back.modified(), 5);
         assert_eq!(back.scan_state(), ScanState::Complete);
     }
 
@@ -880,36 +868,6 @@ mod tests {
         denied.set_scan_state(ScanState::Denied);
         parent.absorb(&denied);
         assert_eq!(parent.scan_state(), ScanState::Partial);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn resolve_and_remove_handle_prefix_mismatches() {
-        let mut tree = DiskEntry::new(PathBuf::from("/private/var/root"), EntryType::Directory);
-        let mut child = DiskEntry::new("logs", EntryType::Directory);
-        child.allocated_size = 100;
-        tree.children.push(child);
-        tree.allocated_size = 100;
-
-        // Path with display prefix /var/root/logs instead of /private/var/root/logs
-        let display_path = Path::new("/var/root/logs");
-        assert!(tree.resolve(display_path).is_some());
-
-        let removed = tree.remove(display_path);
-        assert!(removed.is_some());
-        assert_eq!(tree.allocated_size, 0);
-        assert!(tree.children.is_empty());
-    }
-
-    #[test]
-    fn private_prefix_is_not_a_generic_alias() {
-        let mut tree = DiskEntry::new(PathBuf::from("/private/custom"), EntryType::Directory);
-        tree.children
-            .push(DiskEntry::new("entry", EntryType::Directory));
-
-        assert!(tree.resolve(Path::new("/custom/entry")).is_none());
-        assert!(tree.remove(Path::new("/custom/entry")).is_none());
-        assert_eq!(tree.children.len(), 1);
     }
 
     #[test]

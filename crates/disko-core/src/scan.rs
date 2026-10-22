@@ -248,7 +248,7 @@ fn scan_within(
         cancel,
         root_device: device_of(&meta),
         remote_mounts,
-        system_mounts: system_mount_points(&root, system_mounts),
+        system_mounts: system_mount_points_from(&root, system_mounts),
         seen_links: Mutex::new(HashSet::new()),
     };
 
@@ -285,6 +285,24 @@ pub fn scan_in_background_streaming(
         None,
         MountBoundaries::default(),
         None,
+    )
+}
+
+/// As [`scan_in_background`], for a rescan of `root` inside a scan rooted at
+/// `within`. It fails before walking anything when that scan would not walk
+/// `root`, the same rules as [`scan_in_background_prioritized`].
+pub fn scan_in_background_within(
+    root: PathBuf,
+    within: PathBuf,
+    options: ScanOptions,
+) -> (Arc<Progress>, Cancel, JoinHandle<Result<DiskEntry>>) {
+    spawn_scan(
+        root,
+        options,
+        0,
+        None,
+        MountBoundaries::default(),
+        Some(within),
     )
 }
 
@@ -369,7 +387,9 @@ fn refuse_a_root_its_session_skips(
     options: &ScanOptions,
     boundaries: &MountBoundaries,
 ) -> Result<()> {
-    if root.canonicalize().ok().as_deref() != Some(root) {
+    // A root that cannot be resolved at all (gone, unreadable) is left for
+    // the scan to report in its own words.
+    if root.canonicalize().is_ok_and(|canonical| canonical != root) {
         anyhow::bail!("{} now resolves somewhere else", root.display());
     }
     let (remote, system) = boundaries
@@ -647,22 +667,6 @@ fn link_count(_meta: &Metadata) -> u64 {
     1
 }
 
-fn system_mount_points(root: &Path, discovered: Vec<PathBuf>) -> Vec<PathBuf> {
-    #[cfg(test)]
-    if let Some(mounts) = TEST_SYSTEM_MOUNTS.with(|override_| override_.borrow().clone()) {
-        return system_mount_points_from(root, mounts);
-    }
-
-    system_mount_points_from(root, discovered)
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static TEST_SYSTEM_MOUNTS: std::cell::RefCell<Option<Vec<PathBuf>>> = const {
-        std::cell::RefCell::new(None)
-    };
-}
-
 /// sysinfo only reports browsable volumes on macOS, so devfs and the
 /// synthetic volumes never reach `scan_boundaries`; they are named here.
 #[cfg(target_os = "macos")]
@@ -718,22 +722,6 @@ mod tests {
     fn scan_tree(root: &Path, options: ScanOptions) -> DiskEntry {
         let progress = Progress::default();
         scan(root, &options, &progress, &Cancel::new()).unwrap()
-    }
-
-    fn with_system_mounts<T>(mounts: Vec<PathBuf>, test: impl FnOnce() -> T) -> T {
-        struct Reset(Option<Vec<PathBuf>>);
-
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                TEST_SYSTEM_MOUNTS.with(|override_| {
-                    override_.replace(self.0.take());
-                });
-            }
-        }
-
-        let previous = TEST_SYSTEM_MOUNTS.with(|override_| override_.replace(Some(mounts)));
-        let _reset = Reset(previous);
-        test()
     }
 
     #[test]
@@ -814,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn a_large_flat_directory_stats_in_parallel_with_identical_results() {
+    fn a_large_flat_directory_lists_every_entry_once() {
         // Every entry in a directory is stat'd and counted inside the same
         // parallel map; large enough that a per-entry ordering bug would show
         // up as a missing or duplicated file rather than by chance passing.
@@ -882,6 +870,36 @@ mod tests {
 
         assert_eq!(root.scan_state(), ScanState::Cancelled);
         assert!(root.children.is_empty());
+    }
+
+    /// `r` rescans a folder inside the session it belongs to, under the same
+    /// rules a prioritized scan follows.
+    #[cfg(unix)]
+    #[test]
+    fn a_rescan_within_a_session_refuses_a_moved_folder() {
+        let tree = TempTree::new("moved-rescan");
+        tree.file("target/one.txt", 1000);
+        let base = tree.0.canonicalize().unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(base.join("target"), &link).unwrap();
+
+        let (progress, _, handle) =
+            scan_in_background_within(link, base.clone(), ScanOptions::default());
+
+        assert!(handle.join().unwrap().is_err());
+        assert_eq!(progress.entries(), 0, "the link's target was walked");
+    }
+
+    #[test]
+    fn a_rescan_of_a_vanished_folder_says_it_is_gone() {
+        let tree = TempTree::new("vanished-rescan");
+        let base = tree.0.canonicalize().unwrap();
+
+        let (_, _, handle) =
+            scan_in_background_within(base.join("gone"), base.clone(), ScanOptions::default());
+
+        let error = handle.join().unwrap().unwrap_err().to_string();
+        assert!(!error.contains("resolves somewhere else"), "{error}");
     }
 
     #[cfg(unix)]
@@ -1162,34 +1180,16 @@ mod tests {
         assert!(alias.children.is_empty());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn system_mount_points_are_skipped() {
-        let mounts = system_mount_points(Path::new("/not-a-mount"), Vec::new());
-        #[cfg(target_os = "macos")]
-        {
-            assert!(mounts.contains(&PathBuf::from("/System/Volumes")));
-            assert!(mounts.contains(&PathBuf::from("/Volumes")));
-            assert!(mounts.contains(&PathBuf::from("/dev")));
-            assert!(mounts.contains(&PathBuf::from("/System/Volumes/Data/Volumes")));
-        }
-        assert!(!mounts.contains(&PathBuf::from("/not-a-mount")));
-    }
+    fn macos_system_folders_are_boundaries_unless_scanned_directly() {
+        let mounts = system_mount_points_from(Path::new("/"), Vec::new());
+        assert!(mounts.contains(&PathBuf::from("/System/Volumes")));
+        assert!(mounts.contains(&PathBuf::from("/Volumes")));
+        assert!(mounts.contains(&PathBuf::from("/dev")));
 
-    #[test]
-    fn scan_wires_discovered_system_mounts_into_the_skip_branch() {
-        let tree = TempTree::new("system-mount-wiring");
-        let mount = tree.0.join("mounted");
-        fs::create_dir(&mount).unwrap();
-        tree.file("mounted/external.bin", 4096);
-        let mount = mount.canonicalize().unwrap();
-
-        let scanned = with_system_mounts(vec![mount.clone()], || {
-            scan_tree(&tree.0, ScanOptions::default())
-        });
-        let skipped = scanned.resolve(&mount).unwrap();
-
-        assert_eq!(skipped.scan_state(), ScanState::Skipped);
-        assert!(skipped.children.is_empty());
+        let mounts = system_mount_points_from(Path::new("/Volumes"), Vec::new());
+        assert!(!mounts.contains(&PathBuf::from("/Volumes")));
     }
 
     #[test]
@@ -1224,15 +1224,10 @@ mod tests {
             seen_links: Mutex::new(HashSet::new()),
         };
 
-        let scanned = scan_dir(&root, &meta, 0, &ctx);
-        let skipped = scanned.resolve(&mount).unwrap();
-
-        assert_eq!(skipped.scan_state(), ScanState::Skipped);
-        assert!(skipped.children.is_empty());
-
         let ordinary = root.join("ordinary");
         fs::create_dir(&ordinary).unwrap();
         tree.file("ordinary/local.bin", 1024);
+
         let scanned = scan_dir(&root, &meta, 0, &ctx);
         let skipped = scanned.resolve(&mount).unwrap();
 

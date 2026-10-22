@@ -90,11 +90,15 @@ pub fn shorten_breadcrumb<T: AsRef<str>>(parts: &[T], max: usize) -> String {
     }
     let sep = " › ";
     let sep_width = width(sep);
-    let full = parts
-        .iter()
-        .map(|p| p.as_ref())
-        .collect::<Vec<_>>()
-        .join(sep);
+    let ellipsis_width = width("…");
+    let join = |parts: &[T]| {
+        parts
+            .iter()
+            .map(|p| p.as_ref())
+            .collect::<Vec<_>>()
+            .join(sep)
+    };
+    let full = join(parts);
     if width(&full) <= max {
         return full;
     }
@@ -115,13 +119,8 @@ pub fn shorten_breadcrumb<T: AsRef<str>>(parts: &[T], max: usize) -> String {
 
     // Try: first › … › [tail components]
     for tail_count in (1..parts.len() - 1).rev() {
-        let tail = &parts[parts.len() - tail_count..];
-        let tail_str = tail
-            .iter()
-            .map(|p| p.as_ref())
-            .collect::<Vec<_>>()
-            .join(sep);
-        let candidate_width = first_len + sep_width + 1 + sep_width + width(&tail_str);
+        let tail_str = join(&parts[parts.len() - tail_count..]);
+        let candidate_width = first_len + sep_width + ellipsis_width + sep_width + width(&tail_str);
         if candidate_width <= max {
             return format!("{first}{sep}…{sep}{tail_str}");
         }
@@ -129,13 +128,8 @@ pub fn shorten_breadcrumb<T: AsRef<str>>(parts: &[T], max: usize) -> String {
 
     // If first › … › tail doesn't fit, try dropping first: "… › [tail components]"
     for tail_count in (1..parts.len()).rev() {
-        let tail = &parts[parts.len() - tail_count..];
-        let tail_str = tail
-            .iter()
-            .map(|p| p.as_ref())
-            .collect::<Vec<_>>()
-            .join(sep);
-        let candidate_width = 1 + sep_width + width(&tail_str);
+        let tail_str = join(&parts[parts.len() - tail_count..]);
+        let candidate_width = ellipsis_width + sep_width + width(&tail_str);
         if candidate_width <= max {
             return format!("…{sep}{tail_str}");
         }

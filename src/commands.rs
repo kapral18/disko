@@ -221,9 +221,12 @@ fn remove(
                 )?;
                 continue;
             }
-            match crate::deletion::delete(path) {
-                Ok(removed_bytes) => {
-                    freed = freed.saturating_add(removed_bytes);
+            let progress = crate::deletion::DeleteProgress::default();
+            let removed = crate::deletion::delete(path, &progress);
+            // On Unix, bytes a failed removal freed before it stopped count too.
+            freed = freed.saturating_add(progress.freed());
+            match removed {
+                Ok(()) => {
                     writeln!(out, " removed {}", display_path(path))?;
                 }
                 Err(error) => {
@@ -295,14 +298,25 @@ struct PublicSnapshot<'a> {
 
 impl<'a> From<&'a Snapshot> for PublicSnapshot<'a> {
     fn from(snapshot: &'a Snapshot) -> Self {
+        // Destructured so a field added to `Snapshot` fails to compile here
+        // instead of silently missing from `history --json`.
+        let Snapshot {
+            root,
+            taken_at,
+            total_allocated,
+            total_apparent,
+            items,
+            floor,
+            tree,
+        } = snapshot;
         Self {
-            root: &snapshot.root,
-            taken_at: snapshot.taken_at,
-            total_allocated: snapshot.total_allocated,
-            total_apparent: snapshot.total_apparent,
-            items: snapshot.items,
-            floor: snapshot.floor,
-            tree: PublicTree(&snapshot.tree),
+            root,
+            taken_at: *taken_at,
+            total_allocated: *total_allocated,
+            total_apparent: *total_apparent,
+            items: *items,
+            floor: *floor,
+            tree: PublicTree(tree),
         }
     }
 }
@@ -485,7 +499,9 @@ mod tests {
         let options = options();
 
         let mut out = Vec::new();
-        remove(&mut out, &groups, &options, true).unwrap();
+        let removed = remove(&mut out, &groups, &options, true);
+        let _ = std::fs::remove_dir_all(&base);
+        removed.unwrap();
 
         let text = String::from_utf8(out).unwrap();
         // Matched by line rather than as "Freed <size>": on a terminal the
@@ -501,7 +517,6 @@ mod tests {
             )),
             "{text}"
         );
-        let _ = std::fs::remove_dir_all(base);
     }
 
     /// Two scans within the same second must not write over each other, or

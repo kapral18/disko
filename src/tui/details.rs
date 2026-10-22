@@ -156,7 +156,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
         format!(
             " Details · {} scanning ({} items) — d to close ",
             theme::spinner(tick),
-            progress.entries()
+            crate::output::count(progress.entries())
         )
     } else if app.outcomes.is_empty() {
         " Details — d to close ".to_string()

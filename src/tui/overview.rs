@@ -170,30 +170,21 @@ fn draw_current_folder(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     let mut right_span = None;
     let mut right_width = 0;
 
-    if let Some(taken_at) = app.provisional_for_cwd() {
-        let age = disko_core::history::now().saturating_sub(taken_at);
-        let rescan_str = format!(
-            "as of {} · {} rescanning…",
-            crate::timefmt::ago(age),
-            theme::spinner(tick)
-        );
-        right_width = crate::tui::text::width(&rescan_str);
-        right_span = Some(Span::styled(rescan_str, theme::warning()));
-    } else if app.cwd_is_being_scanned() {
-        // A refresh keeps the old numbers on screen until it lands; say so,
-        // even when the footer is busy reporting a deletion.
-        let rescan_str = format!("{} rescanning…", theme::spinner(tick));
-        right_width = crate::tui::text::width(&rescan_str);
-        right_span = Some(Span::styled(rescan_str, theme::warning()));
-    } else if let Some(note) = incomplete_note(entry) {
-        let note_str = note;
-        right_width = crate::tui::text::width(&note_str);
-        right_span = Some(Span::styled(note_str, theme::warning()));
+    // A refresh keeps the old numbers on screen until it lands; say so, even
+    // when the footer is busy reporting a deletion — but never at the cost of
+    // the folder's own name.
+    let display_p = model::display_path(&app.cwd);
+    let path_floor = MIN_PATH_WIDTH.min(crate::tui::text::width(&display_p));
+    let room = total.saturating_sub(left_fixed_width + growth_width + 2 + path_floor);
+    let note = rescan_note(app, tick, room)
+        .or_else(|| incomplete_note(entry).filter(|note| crate::tui::text::width(note) <= room));
+    if let Some(note) = note {
+        right_width = crate::tui::text::width(&note);
+        right_span = Some(Span::styled(note, theme::warning()));
     }
 
     let gap = if right_span.is_some() { 2 } else { 0 };
     let path_budget = total.saturating_sub(left_fixed_width + growth_width + right_width + gap);
-    let display_p = model::display_path(&app.cwd);
     let path_text = if crate::tui::text::width(&display_p) <= path_budget {
         display_p
     } else if path_budget >= 6 {
@@ -227,13 +218,40 @@ fn draw_current_folder(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Columns a header keeps for the folder's name (or all of a shorter one)
+/// before it makes room for a note beside it.
+pub(crate) const MIN_PATH_WIDTH: usize = 12;
+
+/// The header note while the folder on screen is still being counted, shared
+/// by the list and the chart so the two never disagree. It drops the
+/// snapshot's age, then the whole note, when it would not fit in `room`.
+pub(crate) fn rescan_note(app: &App, tick: usize, room: usize) -> Option<String> {
+    let short = format!("{} rescanning…", theme::spinner(tick));
+    let full = if let Some(taken_at) = app.provisional_for_cwd() {
+        let age = crate::timefmt::ago(disko_core::history::now().saturating_sub(taken_at));
+        if !app.cwd_is_being_scanned() {
+            // A stopped scan left the snapshot on screen.
+            return Some(format!("as of {age}"))
+                .filter(|note| crate::tui::text::width(note) <= room);
+        }
+        format!("as of {age} · {short}")
+    } else if app.cwd_is_being_scanned() {
+        short.clone()
+    } else {
+        return None;
+    };
+    [full, short]
+        .into_iter()
+        .find(|note| crate::tui::text::width(note) <= room)
+}
+
 /// Says so out loud when the numbers are a floor rather than a total.
 fn incomplete_note(entry: &DiskEntry) -> Option<String> {
     match entry.scan_state() {
         ScanState::Complete => None,
         ScanState::Denied => Some("unreadable".to_string()),
         ScanState::Cancelled => Some("scan cancelled — sizes incomplete".to_string()),
-        ScanState::Skipped => Some("not scanned — mount point".to_string()),
+        ScanState::Skipped => Some("not scanned — mount or system folder".to_string()),
         ScanState::Partial => Some("some folders skipped or unreadable".to_string()),
     }
 }
@@ -435,6 +453,7 @@ pub(crate) fn no_rows_message(app: &App, tick: usize) -> String {
             Listing::Complete => "nothing matches that search".to_string(),
             Listing::Short => "nothing listed matches yet".to_string(),
             Listing::BeyondDepth => "nothing listed — beyond --depth".to_string(),
+            Listing::Skipped => "nothing listed — not scanned".to_string(),
         };
     }
     if app.showing_growth() {
@@ -447,6 +466,7 @@ pub(crate) fn no_rows_message(app: &App, tick: usize) -> String {
         // The run's own root: running disko here is what was just done.
         Listing::BeyondDepth if app.cwd == app.root => "beyond --depth".to_string(),
         Listing::BeyondDepth => "beyond --depth — run disko here".to_string(),
+        Listing::Skipped => "not scanned — run disko here".to_string(),
         Listing::Short if app.cwd_is_being_scanned() && app.cwd_focus_refused() => {
             format!("{} waiting for the full scan…", theme::spinner(tick))
         }
@@ -512,7 +532,7 @@ mod tests {
 
         assert_eq!(
             incomplete_note(&entry).as_deref(),
-            Some("not scanned — mount point")
+            Some("not scanned — mount or system folder")
         );
     }
 }

@@ -87,14 +87,14 @@ pub fn run(mut app: App) -> Result<()> {
     // The process is about to exit, which hands the memory back at once;
     // freeing a whole-disk tree entry by entry would keep the shell waiting.
     std::mem::forget(app);
-    leave(&mut terminal)?;
+    let left = leave(&mut terminal);
     if browsing_view != saved_view
         && let Some(path) = preference_path
         && let Err(error) = preferences::save(&path, browsing_view)
     {
         eprintln!("disko: could not save the view preference: {error}");
     }
-    result
+    result.and(left)
 }
 
 fn enter() -> Result<TuiTerminal> {
