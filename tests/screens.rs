@@ -135,7 +135,7 @@ fn disk_capacity_and_directory_usage_are_never_the_same_line() {
 }
 
 #[test]
-fn filesystem_language_stays_out_of_the_default_view() {
+fn filesystem_language_stays_out_of_the_list_view() {
     let screen = joined(&render_lines(&mut app(), 100, 30).unwrap());
 
     for jargon in ["apfs", "/dev/disk3s1s1", "inode", "block"] {
@@ -708,9 +708,7 @@ fn finish_scan(app: &mut App) {
 #[test]
 fn a_scan_opens_on_the_chart_unless_the_list_was_picked() {
     let sandbox = Sandbox::new("browse-view");
-    let mut app = app_over(&sandbox.0);
-    app.view = View::Picker;
-    let mut app = app.with_path(&sandbox.0);
+    let mut app = app_over(&sandbox.0).with_path(&sandbox.0);
     finish_scan(&mut app);
     assert_eq!(app.view, View::Explorer);
 

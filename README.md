@@ -228,8 +228,9 @@ and `h` / `←` to go up. Press `Tab` to switch between the chart and this list:
 ```
 
 The view you pick with `Tab` stays in place across scans and disk changes.
-It is saved when you quit, to `~/.config/disko/view`
-(`~/Library/Application Support/disko/view` on macOS), and restored next time.
+It is saved when you quit, to `disko/view` in your config directory
+(`$XDG_CONFIG_HOME` or `~/.config` on Linux, `~/Library/Application Support` on
+macOS, `%APPDATA%` on Windows), and restored next time.
 
 | Key | Does |
 | --- | --- |
@@ -237,7 +238,7 @@ It is saved when you quit, to `~/.config/disko/view`
 | `Tab` | switch between chart and list |
 | `Enter` | open the radial explorer (and drill in, once there) |
 | `l` `→` / `h` `←` `Backspace` | open the selected folder / go back up |
-| `Esc` | close details or search, step from the chart to the list, then back to the disk list |
+| `Esc` | close details or search, step from the chart to the list, then back to the disk list if you came from it |
 | **`t`** | **switch between size and growth** |
 | `/` | filter the list as you type |
 | `s` | cycle sort: size, name, item count |

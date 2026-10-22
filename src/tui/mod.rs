@@ -48,14 +48,14 @@ pub fn run(mut app: App) -> Result<()> {
     apply_saved_view(&mut app, saved_view);
     let mut terminal = enter()?;
     let result = event_loop(&mut terminal, &mut app);
-    leave(&mut terminal)?;
+    let left = leave(&mut terminal);
     if app.browsing_view != saved_view
         && let Some(path) = preference_path
         && let Err(error) = preferences::save(&path, app.browsing_view)
     {
         eprintln!("disko: could not save the view preference: {error}");
     }
-    result
+    result.and(left)
 }
 
 fn enter() -> Result<Terminal<CrosstermBackend<Stdout>>> {

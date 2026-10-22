@@ -12,6 +12,7 @@ repository = "https://github.com/cesarferreira/disko"
 
 [workspace.dependencies]
 anyhow = "1"
+dirs = "6.0.0"
 serde = { version = "1", features = ["derive"] }
 
 [package]
@@ -47,7 +48,7 @@ anyhow.workspace = true
 serde.workspace = true
 ratatui = "0.29"
 crossterm = "0.28"
-dirs = "6.0.0"
+dirs.workspace = true
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 unicode-width = "0.2"
