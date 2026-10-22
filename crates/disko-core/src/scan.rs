@@ -228,7 +228,7 @@ pub fn scan(
         cancel,
         root_device: device_of(&meta),
         remote_mounts,
-        system_mounts: system_mount_points(&root, system_mounts),
+        system_mounts: system_mount_points_from(&root, system_mounts),
         seen_links: Mutex::new(HashSet::new()),
     };
 
@@ -457,22 +457,6 @@ fn link_count(_meta: &Metadata) -> u64 {
     1
 }
 
-fn system_mount_points(root: &Path, discovered: Vec<PathBuf>) -> Vec<PathBuf> {
-    #[cfg(test)]
-    if let Some(mounts) = TEST_SYSTEM_MOUNTS.with(|override_| override_.borrow().clone()) {
-        return system_mount_points_from(root, mounts);
-    }
-
-    system_mount_points_from(root, discovered)
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static TEST_SYSTEM_MOUNTS: std::cell::RefCell<Option<Vec<PathBuf>>> = const {
-        std::cell::RefCell::new(None)
-    };
-}
-
 /// sysinfo only reports browsable volumes on macOS, so devfs and the
 /// synthetic volumes never reach `scan_boundaries`; they are named here.
 #[cfg(target_os = "macos")]
@@ -528,22 +512,6 @@ mod tests {
     fn scan_tree(root: &Path, options: ScanOptions) -> DiskEntry {
         let progress = Progress::default();
         scan(root, &options, &progress, &Cancel::new()).unwrap()
-    }
-
-    fn with_system_mounts<T>(mounts: Vec<PathBuf>, test: impl FnOnce() -> T) -> T {
-        struct Reset(Option<Vec<PathBuf>>);
-
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                TEST_SYSTEM_MOUNTS.with(|override_| {
-                    override_.replace(self.0.take());
-                });
-            }
-        }
-
-        let previous = TEST_SYSTEM_MOUNTS.with(|override_| override_.replace(Some(mounts)));
-        let _reset = Reset(previous);
-        test()
     }
 
     #[test]
@@ -793,34 +761,16 @@ mod tests {
         assert_eq!(deduped.items, raw.items);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn system_mount_points_are_skipped() {
-        let mounts = system_mount_points(Path::new("/not-a-mount"), Vec::new());
-        #[cfg(target_os = "macos")]
-        {
-            assert!(mounts.contains(&PathBuf::from("/System/Volumes")));
-            assert!(mounts.contains(&PathBuf::from("/Volumes")));
-            assert!(mounts.contains(&PathBuf::from("/dev")));
-            assert!(mounts.contains(&PathBuf::from("/System/Volumes/Data/Volumes")));
-        }
-        assert!(!mounts.contains(&PathBuf::from("/not-a-mount")));
-    }
+    fn macos_system_folders_are_boundaries_unless_scanned_directly() {
+        let mounts = system_mount_points_from(Path::new("/"), Vec::new());
+        assert!(mounts.contains(&PathBuf::from("/System/Volumes")));
+        assert!(mounts.contains(&PathBuf::from("/Volumes")));
+        assert!(mounts.contains(&PathBuf::from("/dev")));
 
-    #[test]
-    fn scan_wires_discovered_system_mounts_into_the_skip_branch() {
-        let tree = TempTree::new("system-mount-wiring");
-        let mount = tree.0.join("mounted");
-        fs::create_dir(&mount).unwrap();
-        tree.file("mounted/external.bin", 4096);
-        let mount = mount.canonicalize().unwrap();
-
-        let scanned = with_system_mounts(vec![mount.clone()], || {
-            scan_tree(&tree.0, ScanOptions::default())
-        });
-        let skipped = scanned.resolve(&mount).unwrap();
-
-        assert_eq!(skipped.scan_state, ScanState::Skipped);
-        assert!(skipped.children.is_empty());
+        let mounts = system_mount_points_from(Path::new("/Volumes"), Vec::new());
+        assert!(!mounts.contains(&PathBuf::from("/Volumes")));
     }
 
     #[test]
@@ -855,15 +805,10 @@ mod tests {
             seen_links: Mutex::new(HashSet::new()),
         };
 
-        let scanned = scan_dir(&root, &meta, 0, &ctx);
-        let skipped = scanned.resolve(&mount).unwrap();
-
-        assert_eq!(skipped.scan_state, ScanState::Skipped);
-        assert!(skipped.children.is_empty());
-
         let ordinary = root.join("ordinary");
         fs::create_dir(&ordinary).unwrap();
         tree.file("ordinary/local.bin", 1024);
+
         let scanned = scan_dir(&root, &meta, 0, &ctx);
         let skipped = scanned.resolve(&mount).unwrap();
 

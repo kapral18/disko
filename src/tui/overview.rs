@@ -190,7 +190,7 @@ fn incomplete_note(entry: &DiskEntry) -> Option<String> {
         ScanState::Complete => None,
         ScanState::Denied => Some("unreadable".to_string()),
         ScanState::Cancelled => Some("scan cancelled — sizes incomplete".to_string()),
-        ScanState::Skipped => Some("not scanned — mount point".to_string()),
+        ScanState::Skipped => Some("not scanned — mount or system folder".to_string()),
         ScanState::Partial => Some("some folders skipped or unreadable".to_string()),
     }
 }
@@ -362,7 +362,7 @@ mod tests {
 
         assert_eq!(
             incomplete_note(&entry).as_deref(),
-            Some("not scanned — mount point")
+            Some("not scanned — mount or system folder")
         );
     }
 }

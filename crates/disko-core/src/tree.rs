@@ -30,7 +30,8 @@ pub enum ScanState {
     Denied,
     /// The user stopped the scan before this subtree finished.
     Cancelled,
-    /// Deliberately not descended into (other filesystem, depth limit).
+    /// Deliberately not descended into: another filesystem with `-x`, or a
+    /// network or system mount.
     Skipped,
 }
 

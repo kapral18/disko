@@ -351,13 +351,14 @@ $ disko /mnt --plain          # a blobfuse2 mount lives under here
 Pass `--remote` to walk them anyway. Naming a network mount as the scan root
 still scans it — asking for it is asking for it.
 
-The same goes for mounts that hold operating-system internals rather than your
-files: on Linux, pseudo filesystems such as `proc`, `sysfs`, `tmpfs` (`/tmp`
-included, where it is tmpfs), `overlay`, `squashfs` and snap mounts; on macOS,
-`/dev`, `/Volumes` and `/System/Volumes`. They show up in the tree as skipped,
-and naming one as the scan root still scans it. A mount point is judged by
-what is mounted there now, so a real filesystem mounted over an autofs
-placeholder (a systemd automount on `/boot`, say) is walked.
+Mounts and system folders that hold operating-system internals rather than your
+files are skipped too, and `--remote` does not change that: on Linux, pseudo
+filesystems such as `proc`, `sysfs`, `tmpfs` (`/tmp` included, where it is
+tmpfs), `overlay`, `squashfs` and snap mounts; on macOS, `/dev`, `/Volumes` and
+`/System/Volumes`. They show up in the tree as skipped, and naming one as the
+scan root still scans it. A mount point is judged by what is mounted there now,
+so a real filesystem mounted over an autofs placeholder (a systemd automount on
+`/boot`, say) is walked.
 
 Note that `--depth` limits what is *kept*, not what is *walked*: sizes stay
 exact, so it does not make a slow mount fast.
