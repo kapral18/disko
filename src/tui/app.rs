@@ -501,6 +501,9 @@ pub const FINISHING: &str = "finishing — the count is done…";
 /// Said while a stopped rescan's partial count is on its way.
 const STOPPED_SHORT: &str = "stopping — showing what was counted so far";
 
+/// What `t` says once the scan correcting a snapshot was stopped.
+const STOPPED_OVER_SNAPSHOT: &str = "scan was stopped — R rescans and compares";
+
 /// Said while a stopped scan whose result is discarded winds down.
 const STOPPING: &str = "stopping the background scan…";
 
@@ -1630,7 +1633,11 @@ impl App {
         // A stop that came too late to cut the count short said so, or
         // promised a partial count; the full count is here now.
         if self.status.as_deref() == Some(FINISHING)
-            || !cancelled && self.status.as_deref() == Some(STOPPED_SHORT)
+            || !cancelled
+                && matches!(
+                    self.status.as_deref(),
+                    Some(STOPPED_SHORT | STOPPED_OVER_SNAPSHOT)
+                )
         {
             self.status = None;
         }
@@ -1681,7 +1688,7 @@ impl App {
                         .as_ref()
                         .is_some_and(|session| session.discard_on_finish)
             {
-                "scan was stopped — R rescans and compares".into()
+                STOPPED_OVER_SNAPSHOT.into()
             } else if self.provisional.is_some() && self.session.is_some() {
                 "comparing with the snapshot once this scan lands".into()
             } else if self.changed_since_scan {
@@ -3904,6 +3911,39 @@ mod tests {
             "{:?}",
             app.status
         );
+    }
+
+    #[test]
+    fn a_whole_landing_after_a_stop_drops_the_stopped_growth_message() {
+        let mut app = app_with_tree();
+        app.provisional = Some(disko_core::history::now().saturating_sub(7200));
+        app.session = Some(Session {
+            scanned_path: app.root.clone(),
+            kind: SessionKind::Root,
+            progress: Arc::new(Progress::default()),
+            cancel: Cancel::new(),
+            handle: None,
+            started: Instant::now(),
+            discard_on_finish: false,
+        });
+        app.cancel_background_scan();
+        app.toggle_metric();
+        assert_eq!(app.status.as_deref(), Some(STOPPED_OVER_SNAPSHOT));
+
+        // The stop came too late: the whole count lands.
+        let mut whole = DiskEntry::new(PathBuf::from("/disko-test-root"), EntryType::Directory);
+        whole.allocated_size = 400;
+        hand_over(&mut app, {
+            let handle = std::thread::spawn(move || Ok(whole));
+            while !handle.is_finished() {
+                std::thread::yield_now();
+            }
+            handle
+        });
+        app.poll_scan();
+
+        assert_eq!(app.tree.as_ref().unwrap().allocated_size, 400);
+        assert_eq!(app.status, None);
     }
 
     #[test]
