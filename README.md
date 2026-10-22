@@ -320,12 +320,12 @@ disko --filesystems    # every mount, pseudo-filesystems included
 disko --inodes         # inode usage instead of bytes
 ```
 
-On macOS, one disk is mounted as two volumes: a sealed, read-only system
-volume at `/` and the writable Data volume at `/System/Volumes/Data`. disko
-lists them as one writable `/` row with inodes counted from both, in
+On macOS, one disk is mounted as two volumes: a sealed, read-only system volume
+at `/` and the writable Data volume at `/System/Volumes/Data`. disko lists them
+as one writable `/` row with inodes counted from both, in
 `--filesystems --json` too. Reports about one path (`--filesystems <path>`,
-`--inodes <path>`, `--details`) name the volume the path lives on: `/System`
-is on the system volume, `~` on the Data volume.
+`--inodes <path>`, `--details`, `d` in the TUI) name the volume the path lives
+on: `/System` is on the system volume, `~` on the Data volume.
 
 ## Scripting
 

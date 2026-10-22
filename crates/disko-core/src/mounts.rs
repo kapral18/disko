@@ -187,13 +187,10 @@ pub fn for_path(path: &Path) -> Option<Filesystem> {
     if let Some(raw) = raw_statfs(&absolute) {
         let mount_point = c_path(&raw.f_mntonname);
         return Some(
-            match filesystems
-                .iter()
-                .position(|fs| fs.mount_point == mount_point)
-            {
-                Some(index) => filesystems.into_iter().nth(index)?,
-                None => unlisted_filesystem(&raw),
-            },
+            filesystems
+                .into_iter()
+                .find(|fs| fs.mount_point == mount_point)
+                .unwrap_or_else(|| unlisted_filesystem(&raw)),
         );
     }
     filesystems
@@ -361,8 +358,9 @@ fn collect() -> Vec<Filesystem> {
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 const MNT_REMOVABLE: u32 = 0x0000_0200;
 
-/// A row for a mount sysinfo leaves out (it lists only browsable volumes, so
-/// not devfs or the hidden APFS volumes), built from the `statfs` that found it.
+/// A row for a mount sysinfo leaves out (it lists only local, browsable
+/// volumes, so not devfs, the hidden APFS volumes or network shares), built
+/// from the `statfs` that found it.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn unlisted_filesystem(raw: &libc::statfs) -> Filesystem {
     let mount_point = c_path(&raw.f_mntonname);
@@ -747,6 +745,23 @@ mod tests {
         let root = for_path(Path::new("/")).expect("every system has a root filesystem");
         assert!(root.total > 0);
         assert!(root.used_fraction() >= 0.0 && root.used_fraction() <= 1.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_disk_list_shows_the_startup_disk_as_one_writable_row() {
+        let listed = list(false);
+
+        assert!(
+            !listed
+                .iter()
+                .any(|fs| fs.mount_point == Path::new("/System/Volumes/Data"))
+        );
+        let root = listed
+            .iter()
+            .find(|fs| fs.mount_point == Path::new("/"))
+            .unwrap();
+        assert!(!root.read_only);
     }
 
     #[cfg(target_os = "macos")]
