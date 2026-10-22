@@ -40,33 +40,39 @@ fn deletion_status(
     });
     let incomplete = first_problem.is_some_and(Outcome::changed_tree);
 
-    match (deleted, skipped) {
-        (0, _) if incomplete => problem_hint
-            .map(|hint| match freed {
-                0 => format!("deletion incomplete — {hint}"),
-                _ => format!(
-                    "deletion incomplete · freed {} — {hint}",
-                    disko_core::size::format(freed, unit)
-                ),
-            })
-            .unwrap_or_else(|| "deletion incomplete — d for details".into()),
-        (0, _) => problem_hint
+    match (deleted, skipped, problem_hint) {
+        (0, _, Some(hint)) if incomplete => match freed {
+            0 => format!("deletion incomplete — {hint}"),
+            _ => format!(
+                "deletion incomplete · freed {} — {hint}",
+                disko_core::size::format(freed, unit)
+            ),
+        },
+        (0, _, hint) => hint
             .map(|hint| format!("nothing deleted — {hint}"))
             .unwrap_or_else(|| "nothing deleted — d for details".into()),
-        (n, 0) => format!(
+        (n, 0, _) => format!(
             "deleted {n} · freed {}",
             disko_core::size::format(freed, unit)
         ),
-        (n, 1) => {
+        // A half-removed item is not merely skipped: say so even when others
+        // were deleted. The hint names it.
+        (n, 1, Some(hint)) if incomplete => format!(
+            "deleted {n} · freed {} · deletion incomplete — {hint}",
+            disko_core::size::format(freed, unit)
+        ),
+        (n, skipped, Some(hint)) if incomplete => format!(
+            "deleted {n} · freed {} · {skipped} not deleted · deletion incomplete — {hint} · d for details",
+            disko_core::size::format(freed, unit)
+        ),
+        (n, 1, hint) => {
             let base = format!(
                 "deleted {n} · freed {} · 1 skipped",
                 disko_core::size::format(freed, unit)
             );
-            problem_hint
-                .map(|hint| format!("{base} — {hint}"))
-                .unwrap_or(base)
+            hint.map(|hint| format!("{base} — {hint}")).unwrap_or(base)
         }
-        (n, skipped) => format!(
+        (n, skipped, _) => format!(
             "deleted {n} · freed {} · {skipped} skipped — d for details",
             disko_core::size::format(freed, unit)
         ),
@@ -328,7 +334,7 @@ impl App {
     }
 
     /// Scan the same place again without disturbing the view — what watch mode
-    /// does on every tick, and what `r` does on demand.
+    /// does on every tick.
     pub fn refresh(&mut self) {
         if self.root.as_os_str().is_empty() || self.session.is_some() || self.deleting.is_some() {
             return;
@@ -1361,6 +1367,7 @@ mod tests {
         app.begin(&PathBuf::from("/root"), ScanMode::Refresh);
 
         app.request_delete();
+        app.cancel_scan();
 
         assert!(app.confirm.is_none());
         assert!(app.status.as_deref().unwrap().contains("scan to finish"));
@@ -1374,6 +1381,7 @@ mod tests {
         app.begin(&PathBuf::from("/root"), ScanMode::Refresh);
 
         app.commit_delete();
+        app.cancel_scan();
 
         assert!(app.deleting.is_none());
         assert!(app.confirm.is_some());
@@ -1551,6 +1559,14 @@ mod tests {
 
         assert!(status.starts_with("deletion incomplete"), "{status}");
         assert!(status.contains("interrupted"), "{status}");
+        assert!(status.contains("after removing 1 entry"), "{status}");
+
+        // Others deleted first: the half-removed item is still not "skipped".
+        for skipped in [1, 3] {
+            let status = deletion_status(1, skipped, 10, &outcomes, Unit::Decimal);
+            assert!(status.contains("deletion incomplete"), "{status}");
+            assert!(!status.contains("skipped"), "{status}");
+        }
     }
 
     #[test]

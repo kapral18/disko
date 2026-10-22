@@ -167,8 +167,9 @@ impl DeleteProgress {
 ///
 /// Unlike [`delete_all`], nothing here compares against a scan: the identities
 /// it guards with are read on entry, so they only catch a swap between that
-/// read and the removal.
-pub fn delete(path: &Path) -> std::io::Result<u64> {
+/// read and the removal. [`check`] still refuses a mount point. `progress`
+/// counts what was freed, on Unix including by a removal that then fails.
+pub fn delete(path: &Path, progress: &DeleteProgress) -> std::io::Result<()> {
     let name = path.file_name().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -181,23 +182,11 @@ pub fn delete(path: &Path) -> std::io::Result<u64> {
         .unwrap_or_else(|| Path::new("."))
         .canonicalize()?;
     let path = root.join(name);
-    #[cfg(unix)]
-    let expected_root_identity = {
-        use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::symlink_metadata(&root)?;
-        Some((meta.dev(), meta.ino()))
-    };
-    #[cfg(unix)]
-    let expected_target_identity = {
-        use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::symlink_metadata(&path)?;
-        Some((meta.dev(), meta.ino()))
-    };
-    #[cfg(not(unix))]
-    let expected_root_identity = None;
-    #[cfg(not(unix))]
-    let expected_target_identity = None;
-    let progress = DeleteProgress::default();
+    check(&path, &root).map_err(|reason| {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, reason.to_string())
+    })?;
+    let expected_root_identity = identity_of(&root)?;
+    let expected_target_identity = identity_of(&path)?;
     delete_watched(
         &path,
         &root,
@@ -205,10 +194,25 @@ pub fn delete(path: &Path) -> std::io::Result<u64> {
             root: expected_root_identity,
             target: expected_target_identity,
         },
-        &progress,
+        progress,
         &Cancel::new(),
-    )?;
-    Ok(progress.freed())
+    )
+}
+
+/// `(device, inode)` of `path` itself, not of what a symlink there points at.
+/// `None` where the platform has no inode to compare.
+fn identity_of(path: &Path) -> std::io::Result<Option<(u64, u64)>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path)?;
+        Ok(Some((meta.dev(), meta.ino())))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(None)
+    }
 }
 
 /// Remove a path, counting entries as they go and stopping if asked.
@@ -224,6 +228,7 @@ fn delete_watched(
 ) -> std::io::Result<()> {
     #[cfg(unix)]
     {
+        raise_open_file_limit();
         unix_delete::delete(path, root, expected, progress, cancel)
     }
     #[cfg(not(unix))]
@@ -233,11 +238,42 @@ fn delete_watched(
     }
 }
 
+/// The descriptor walk keeps a few descriptors open per directory level, so
+/// macOS's default soft limit of 256 stops it about 80 levels down. Raise the
+/// soft limit to the hard one, once per process.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    static RAISED: std::sync::Once = std::sync::Once::new();
+    RAISED.call_once(|| {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is valid writable storage for one `rlimit`.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return;
+        }
+        // macOS refuses a soft limit above `OPEN_MAX` even when the hard limit
+        // is unlimited.
+        #[cfg(target_vendor = "apple")]
+        let wanted = limit.rlim_max.min(10_240);
+        #[cfg(not(target_vendor = "apple"))]
+        let wanted = limit.rlim_max;
+        if wanted > limit.rlim_cur {
+            limit.rlim_cur = wanted;
+            // SAFETY: `limit` is a valid `rlimit`; failing leaves the old limit.
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+        }
+    });
+}
+
 #[cfg(unix)]
 mod unix_delete {
     use super::*;
     use rustix::fd::{AsFd, OwnedFd};
-    use rustix::fs::{AtFlags, Dir, Mode, OFlags, Stat, fchmod, fstat, openat, statat, unlinkat};
+    use rustix::fs::{
+        AtFlags, Dir, FileType, Mode, OFlags, Stat, fchmod, fstat, openat, statat, unlinkat,
+    };
     use rustix::path::Arg;
     use std::ffi::{CString, OsStr, OsString};
     use std::io;
@@ -642,7 +678,10 @@ mod unix_delete {
             }
             let child = child?;
             let name = child.file_name();
-            if is_dot(name) {
+            // Only a directory can hold a mount; skip what the listing
+            // already knows is not one.
+            if is_dot(name) || !matches!(child.file_type(), FileType::Directory | FileType::Unknown)
+            {
                 continue;
             }
             match open_directory(directory, name) {
@@ -1139,11 +1178,17 @@ mod unix_delete {
             assert!(mountinfo.borrow().is_none());
             linux_mount_from_mountinfo(&root, &mountinfo).unwrap();
             assert!(mountinfo.borrow().is_some());
-            let cached = mountinfo.borrow().clone();
-            // A second, different lookup reuses the same cached table rather
-            // than reading `/proc/self/mountinfo` again.
-            linux_mount_from_mountinfo(&proc, &mountinfo).unwrap();
-            assert_eq!(mountinfo.borrow().clone(), cached);
+
+            // A table already read is used as it is rather than read again:
+            // holding only `/`, it places even `/proc` on `/`.
+            let mountinfo =
+                std::cell::RefCell::new(Some(std::collections::HashSet::from([PathBuf::from(
+                    "/",
+                )])));
+            assert!(
+                linux_mount_from_mountinfo(&proc, &mountinfo).unwrap()
+                    == LinuxMount::MountPoint(PathBuf::from("/"))
+            );
         }
     }
 
@@ -1527,7 +1572,10 @@ impl Outcome {
                 error,
                 removed_entries,
                 ..
-            } => format!("{error} after removing {removed_entries} entries"),
+            } => match removed_entries {
+                1 => format!("{error} after removing 1 entry"),
+                _ => format!("{error} after removing {removed_entries} entries"),
+            },
         }
     }
 }
@@ -1604,17 +1652,25 @@ pub fn delete_all(
                         tree_needs_rescan: freed != target.allocated_size,
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Outcome::Failed {
-                    path: target.path.clone(),
-                    error: "stopped part-way through".to_string(),
-                    removed_bytes: progress.freed().saturating_sub(bytes_before),
-                    removed_entries: progress.files_removed().saturating_sub(files_before),
-                    tree_may_have_changed: progress.files_removed() > files_before
-                        || cfg!(not(unix)) && target.is_dir,
-                },
+                // Nothing under it was touched yet: it was never reached, not
+                // stopped part-way. (Elsewhere than Unix a stop only lands
+                // before `remove_dir_all` starts.)
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::Interrupted
+                        && progress.files_removed() == files_before =>
+                {
+                    Outcome::Refused {
+                        path: target.path.clone(),
+                        reason: Refusal::Stopped,
+                    }
+                }
                 Err(error) => Outcome::Failed {
                     path: target.path.clone(),
-                    error: error.to_string(),
+                    error: if error.kind() == std::io::ErrorKind::Interrupted {
+                        "stopped part-way through".to_string()
+                    } else {
+                        error.to_string()
+                    },
                     removed_bytes: progress.freed().saturating_sub(bytes_before),
                     removed_entries: progress.files_removed().saturating_sub(files_before),
                     tree_may_have_changed: progress.files_removed() > files_before
@@ -1741,7 +1797,7 @@ mod tests {
         let name = format!("disko-relative-delete-{}", std::process::id());
         fs::write(&name, b"temporary").unwrap();
 
-        let result = delete(Path::new(&name));
+        let result = delete(Path::new(&name), &DeleteProgress::default());
         let removed = !Path::new(&name).exists();
         let _ = fs::remove_file(&name);
 
@@ -1816,7 +1872,7 @@ mod tests {
         let victim = tree.dir("victim");
         tree.file("victim/inner.txt", 100);
 
-        delete(&victim).unwrap();
+        delete(&victim, &DeleteProgress::default()).unwrap();
         assert!(!victim.exists());
     }
 
@@ -1830,7 +1886,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&precious, &link).unwrap();
 
-        delete(&link).unwrap();
+        delete(&link, &DeleteProgress::default()).unwrap();
 
         assert!(!link.exists(), "the link should be gone");
         assert!(precious.join("keep.txt").exists(), "its target must not be");
@@ -1917,7 +1973,7 @@ mod tests {
         let (done, finished) = mpsc::channel();
         let target = victim.clone();
         std::thread::spawn(move || {
-            let _ = done.send(delete(&target).map(|_| ()));
+            let _ = done.send(delete(&target, &DeleteProgress::default()));
         });
         let result = finished
             .recv_timeout(Duration::from_secs(10))
@@ -1952,7 +2008,7 @@ mod tests {
         }
         drop(directory);
 
-        delete(&victim).unwrap();
+        delete(&victim, &DeleteProgress::default()).unwrap();
 
         assert!(!victim.exists());
     }
@@ -1966,7 +2022,7 @@ mod tests {
         let alias = tree.0.join("alias");
         std::os::unix::fs::symlink(&real, &alias).unwrap();
 
-        delete(&alias.join("victim.bin")).unwrap();
+        delete(&alias.join("victim.bin"), &DeleteProgress::default()).unwrap();
 
         assert!(!victim.exists());
         assert!(alias.exists());
@@ -2395,9 +2451,11 @@ mod tests {
             &Cancel::new(),
         );
 
+        let kept = victim.exists();
+        let _ = fs::remove_dir_all(&root);
+
         assert!(matches!(outcomes[0], Outcome::Failed { .. }));
-        assert!(victim.exists());
-        fs::remove_dir_all(root).unwrap();
+        assert!(kept);
     }
 
     #[cfg(unix)]
@@ -2594,8 +2652,9 @@ mod tests {
     fn a_nested_mount_is_found_before_any_sibling_is_removed() {
         let temp = TempTree::new("nested-mount-preflight");
         let victim = temp.dir("victim");
-        // Many siblings, so a walk without the preflight is very likely to
-        // remove one before it reaches the mount, whatever readdir's order.
+        // Many siblings, so a walk without the preflight is likely to remove
+        // one before it reaches the mount — unless readdir happens to list the
+        // mount first, which this fixed set of names cannot rule out.
         let siblings: Vec<PathBuf> = (0..16)
             .map(|index| temp.file(&format!("victim/sibling-{index}.bin"), 100))
             .collect();

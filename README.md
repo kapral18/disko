@@ -279,12 +279,13 @@ crash:
  └──────────────────────────────────────────────────────────────┘
 ```
 
-`Esc` stops it after the file it is on, and reports which items it never
-reached. Every path
-is re-checked against the filesystem immediately before removal, so disko will
-refuse the scan root, anything outside the current scan, a mount point, or
-something that has vanished since the scan. Symlinks are unlinked, never
-followed into.
+`Esc` stops it after the file it is on (on Windows, between items), and reports
+which items it never reached. Every path is re-checked against the filesystem
+immediately before removal, so disko will refuse the scan root, anything
+outside the current scan, a mount point or a folder with another filesystem
+mounted inside it, and something that has vanished since the scan (or, on Unix,
+been replaced). Symlinks are unlinked, never followed into. `x` is refused
+while a scan runs.
 
 Totals usually correct themselves instantly, by subtracting what was removed.
 When a deletion stops part-way or frees a different amount than the scan

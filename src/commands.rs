@@ -220,9 +220,12 @@ fn remove(
                 )?;
                 continue;
             }
-            match crate::deletion::delete(path) {
-                Ok(removed_bytes) => {
-                    freed = freed.saturating_add(removed_bytes);
+            let progress = crate::deletion::DeleteProgress::default();
+            let removed = crate::deletion::delete(path, &progress);
+            // On Unix, bytes a failed removal freed before it stopped count too.
+            freed = freed.saturating_add(progress.freed());
+            match removed {
+                Ok(()) => {
                     writeln!(out, " removed {}", display_path(path))?;
                 }
                 Err(error) => {
@@ -442,7 +445,9 @@ mod tests {
         let options = options();
 
         let mut out = Vec::new();
-        remove(&mut out, &groups, &options, true).unwrap();
+        let removed = remove(&mut out, &groups, &options, true);
+        let _ = std::fs::remove_dir_all(&base);
+        removed.unwrap();
 
         let text = String::from_utf8(out).unwrap();
         // Matched by line rather than as "Freed <size>": on a terminal the
@@ -458,6 +463,5 @@ mod tests {
             )),
             "{text}"
         );
-        let _ = std::fs::remove_dir_all(base);
     }
 }
